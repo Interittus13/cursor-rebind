@@ -8,26 +8,18 @@ Works on Linux, macOS, and Windows.
 
 ## Install
 
-### Binary
-
-Download the latest release for your platform:
-
-https://github.com/Interittus13/cursor-rebind/releases
+### Quick install (Linux / macOS)
 
 ```bash
-# Linux (x86_64)
-curl -fsSL -o cursor-rebind.tar.gz \
-  https://github.com/Interittus13/cursor-rebind/releases/latest/download/cursor-rebind_Linux_x86_64.tar.gz
-tar -xzf cursor-rebind.tar.gz
-sudo install -m 755 cursor-rebind /usr/local/bin/cursor-rebind
+curl -fsSL https://raw.githubusercontent.com/Interittus13/cursor-rebind/main/scripts/install.sh | bash
 ```
 
+This downloads the latest release and installs `cursor-rebind` onto your PATH (`~/.local/bin` or `/usr/local/bin`).
+
 ```bash
-# macOS (Apple Silicon)
-curl -fsSL -o cursor-rebind.tar.gz \
-  https://github.com/Interittus13/cursor-rebind/releases/latest/download/cursor-rebind_Darwin_arm64.tar.gz
-tar -xzf cursor-rebind.tar.gz
-sudo install -m 755 cursor-rebind /usr/local/bin/cursor-rebind
+# Optional: pin a version or install location
+CURSOR_REBIND_VERSION=v1.0.0 bash scripts/install.sh
+CURSOR_REBIND_INSTALL_DIR=$HOME/.local/bin bash scripts/install.sh
 ```
 
 ### Go
@@ -36,13 +28,19 @@ sudo install -m 755 cursor-rebind /usr/local/bin/cursor-rebind
 go install github.com/Interittus13/cursor-rebind/cmd/cursor-rebind@latest
 ```
 
+Ensure `$(go env GOPATH)/bin` is on your PATH.
+
 ### From source
 
 ```bash
 git clone https://github.com/Interittus13/cursor-rebind.git
 cd cursor-rebind
-go build -o cursor-rebind ./cmd/cursor-rebind
+make install
 ```
+
+### Windows
+
+Download the Windows archive from [Releases](https://github.com/Interittus13/cursor-rebind/releases), extract `cursor-rebind.exe`, and place it on your PATH — or use WSL with the quick install above.
 
 ## Usage
 
