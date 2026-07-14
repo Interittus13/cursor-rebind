@@ -46,8 +46,19 @@ Download the Windows archive from [Releases](https://github.com/Interittus13/cur
 
 ```bash
 cursor-rebind scan
-cursor-rebind doctor
 cursor-rebind doctor /path/to/project
+
+# Preview a rebind
+cursor-rebind map --from /old/path --to /new/path
+
+# Machine move (rewrite a path prefix)
+cursor-rebind map --from /home/olduser --to /home/newuser --prefix
+
+# Apply (quit Cursor first)
+cursor-rebind migrate --from /old/path --to /new/path --yes
+
+cursor-rebind verify /new/path
+cursor-rebind restore --list
 ```
 
 ## How it works

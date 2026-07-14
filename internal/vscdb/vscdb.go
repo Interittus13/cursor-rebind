@@ -39,15 +39,53 @@ func OpenReadOnly(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// GetItemJSON loads a JSON value from ItemTable by key.
-func GetItemJSON(db *sql.DB, key string, dest any) (bool, error) {
+// OpenReadWrite opens a Cursor state.vscdb for mutation. Caller must ensure Cursor is closed.
+func OpenReadWrite(dbPath string) (*sql.DB, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("stat %s: %w", dbPath, err)
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// SetItemJSON writes a JSON value into ItemTable (insert or replace).
+func SetItemJSON(db *sql.DB, key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO ItemTable(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, raw)
+	return err
+}
+
+// GetItemRaw returns the raw blob for a key.
+func GetItemRaw(db *sql.DB, key string) ([]byte, bool, error) {
 	var raw []byte
 	err := db.QueryRow(`SELECT value FROM ItemTable WHERE key = ?`, key).Scan(&raw)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+// GetItemJSON loads a JSON value from ItemTable by key.
+func GetItemJSON(db *sql.DB, key string, dest any) (bool, error) {
+	raw, ok, err := GetItemRaw(db, key)
+	if err != nil || !ok {
+		return ok, err
 	}
 	if err := json.Unmarshal(raw, dest); err != nil {
 		return false, fmt.Errorf("decode %s: %w", key, err)
