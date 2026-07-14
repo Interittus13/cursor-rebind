@@ -8,11 +8,35 @@ Works on Linux, macOS, and Windows.
 
 ## Install
 
+### Binary
+
+Download the latest release for your platform:
+
+https://github.com/Interittus13/cursor-rebind/releases
+
+```bash
+# Linux (x86_64)
+curl -fsSL -o cursor-rebind.tar.gz \
+  https://github.com/Interittus13/cursor-rebind/releases/latest/download/cursor-rebind_Linux_x86_64.tar.gz
+tar -xzf cursor-rebind.tar.gz
+sudo install -m 755 cursor-rebind /usr/local/bin/cursor-rebind
+```
+
+```bash
+# macOS (Apple Silicon)
+curl -fsSL -o cursor-rebind.tar.gz \
+  https://github.com/Interittus13/cursor-rebind/releases/latest/download/cursor-rebind_Darwin_arm64.tar.gz
+tar -xzf cursor-rebind.tar.gz
+sudo install -m 755 cursor-rebind /usr/local/bin/cursor-rebind
+```
+
+### Go
+
 ```bash
 go install github.com/Interittus13/cursor-rebind/cmd/cursor-rebind@latest
 ```
 
-Or build from source:
+### From source
 
 ```bash
 git clone https://github.com/Interittus13/cursor-rebind.git

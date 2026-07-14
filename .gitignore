@@ -3,9 +3,10 @@
 /bin/
 *.exe
 
-# Build / test
+# Build / test / release
 /dist/
 /coverage.out
+/goreleaser
 
 # Editor / OS
 .DS_Store

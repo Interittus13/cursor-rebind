@@ -12,7 +12,9 @@ import (
 	"github.com/Interittus13/cursor-rebind/internal/paths"
 )
 
-const version = "1.0.0-dev"
+// Version is set at link time by GoReleaser / -ldflags.
+// Local builds fall back to "dev".
+var Version = "dev"
 
 // Execute parses args and runs a subcommand.
 func Execute() error {
@@ -24,7 +26,7 @@ func Execute() error {
 
 	switch args[0] {
 	case "version", "--version", "-V":
-		fmt.Printf("cursor-rebind %s\n", version)
+		fmt.Printf("cursor-rebind %s\n", Version)
 		return nil
 	case "help", "--help", "-h":
 		printUsage()
@@ -49,7 +51,7 @@ Usage:
 Commands:
   scan     Inventory workspaces and chat identity
   doctor   Diagnose missing chats for a project path
-`, version)
+`, Version)
 }
 
 func runScan(args []string) error {
