@@ -1,0 +1,17 @@
+# Binaries
+/cursor-rebind
+/bin/
+*.exe
+
+# Build / test
+/dist/
+/coverage.out
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local notes
+*.local.md
