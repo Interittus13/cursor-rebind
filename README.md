@@ -4,6 +4,8 @@ Move a project. Switch machines. Keep your Cursor chats.
 
 When a folder path changes, Cursor treats it as a new workspace. Your conversations are still on disk — they just lose their identity. cursor-rebind finds them and puts them back where they belong.
 
+Works on Linux, macOS, and Windows.
+
 ## Install
 
 ```bash

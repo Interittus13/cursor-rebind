@@ -41,7 +41,15 @@ func Discover() (Roots, error) {
 }
 
 func userDataDir(home string) (string, error) {
+	// Supported on Linux, macOS, and Windows. Primary development/verification is on Ubuntu Linux;
+	// other platforms rely on standard Cursor paths and community feedback.
 	switch runtime.GOOS {
+	case "linux":
+		xdg := os.Getenv("XDG_CONFIG_HOME")
+		if xdg == "" {
+			xdg = filepath.Join(home, ".config")
+		}
+		return filepath.Join(xdg, "Cursor", "User"), nil
 	case "darwin":
 		return filepath.Join(home, "Library", "Application Support", "Cursor", "User"), nil
 	case "windows":
@@ -50,7 +58,7 @@ func userDataDir(home string) (string, error) {
 			return "", fmt.Errorf("APPDATA is not set")
 		}
 		return filepath.Join(appData, "Cursor", "User"), nil
-	default: // linux and other unix
+	default:
 		xdg := os.Getenv("XDG_CONFIG_HOME")
 		if xdg == "" {
 			xdg = filepath.Join(home, ".config")
@@ -104,7 +112,6 @@ func PathFromFileURI(uri string) string {
 	const prefix = "file://"
 	if len(uri) >= len(prefix) && uri[:len(prefix)] == prefix {
 		p := uri[len(prefix):]
-		// Handle file:///C:/... on Windows later; Linux/macOS are fine.
 		return filepath.FromSlash(p)
 	}
 	return uri
