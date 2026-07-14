@@ -63,7 +63,12 @@ func SetItemJSON(db *sql.DB, key string, value any) error {
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO ItemTable(key, value) VALUES(?, ?)
+	return SetItemRaw(db, key, raw)
+}
+
+// SetItemRaw writes a raw blob into ItemTable (insert or replace).
+func SetItemRaw(db *sql.DB, key string, raw []byte) error {
+	_, err := db.Exec(`INSERT INTO ItemTable(key, value) VALUES(?, ?)
 		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, raw)
 	return err
 }
@@ -72,6 +77,19 @@ func SetItemJSON(db *sql.DB, key string, value any) error {
 func GetItemRaw(db *sql.DB, key string) ([]byte, bool, error) {
 	var raw []byte
 	err := db.QueryRow(`SELECT value FROM ItemTable WHERE key = ?`, key).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+// GetDiskKVRaw returns a value from cursorDiskKV.
+func GetDiskKVRaw(db *sql.DB, key string) ([]byte, bool, error) {
+	var raw []byte
+	err := db.QueryRow(`SELECT value FROM cursorDiskKV WHERE key = ?`, key).Scan(&raw)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}

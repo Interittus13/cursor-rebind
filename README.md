@@ -54,12 +54,20 @@ cursor-rebind map --from /old/path --to /new/path
 # Machine move (rewrite a path prefix)
 cursor-rebind map --from /home/olduser --to /home/newuser --prefix
 
-# Apply (quit Cursor first)
+# Apply (quit Cursor fully first)
 cursor-rebind migrate --from /old/path --to /new/path --yes
+
+# If open tabs are empty / stuck after migrate, repair them (quit Cursor first)
+cursor-rebind repair --from /old/path --to /new/path --target-id <workspace-id> --yes
 
 cursor-rebind verify /new/path
 cursor-rebind restore --list
 ```
+
+**Notes**
+- Quit Cursor completely before `migrate` / `repair` (reload is not enough).
+- `migrate` retags chat headers, binds one primary conversation into the IDE tab strip, updates Agents Window project labels, and detaches duplicate workspace folders.
+- Prefer `--target-id` when multiple `workspaceStorage` entries exist for the same folder (common after a rename).
 
 ## How it works
 

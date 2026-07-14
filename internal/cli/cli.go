@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/Interittus13/cursor-rebind/internal/backup"
@@ -41,6 +42,8 @@ func Execute() error {
 		return runPlan(args[0], args[1:])
 	case "migrate":
 		return runMigrate(args[1:])
+	case "repair":
+		return runRepair(args[1:])
 	case "verify":
 		return runVerify(args[1:])
 	case "restore":
@@ -58,7 +61,8 @@ Usage:
   cursor-rebind doctor [path] [--json]
   cursor-rebind map --from <old> --to <new> [--prefix] [--json]
   cursor-rebind preview --from <old> --to <new> [--prefix]
-  cursor-rebind migrate --from <old> --to <new> [--prefix] [--dry-run|--yes]
+  cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--dry-run|--yes]
+  cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] --yes
   cursor-rebind verify [path]
   cursor-rebind restore <backup-id>
   cursor-rebind restore --list
@@ -69,6 +73,7 @@ Commands:
   doctor    Diagnose missing chats for a project path
   map       Build a rebind plan (alias: preview)
   migrate   Apply a rebind plan (quit Cursor first)
+  repair    Fix open tabs + Agents Window after a partial migrate (quit Cursor first)
   verify    Count headers/transcripts for a path
   restore   Roll back a migrate backup
 `, Version)
@@ -230,14 +235,15 @@ func runDoctor(args []string) error {
 }
 
 type pathFlags struct {
-	from   string
-	to     string
-	prefix bool
-	json   bool
-	dryRun bool
-	yes    bool
-	list   bool
-	help   bool
+	from     string
+	to       string
+	targetID string
+	prefix   bool
+	json     bool
+	dryRun   bool
+	yes      bool
+	list     bool
+	help     bool
 }
 
 func parsePathFlags(args []string) (pathFlags, []string, error) {
@@ -258,6 +264,12 @@ func parsePathFlags(args []string) (pathFlags, []string, error) {
 			}
 			i++
 			f.to = args[i]
+		case "--target-id":
+			if i+1 >= len(args) {
+				return f, nil, fmt.Errorf("--target-id requires a workspace id")
+			}
+			i++
+			f.targetID = args[i]
 		case "--prefix":
 			f.prefix = true
 		case "--json":
@@ -321,7 +333,7 @@ func runPlan(cmd string, args []string) error {
 	if f.prefix {
 		mode = rebind.ModePrefix
 	}
-	plan, err := rebind.BuildPlan(inv, f.from, f.to, mode)
+	plan, err := rebind.BuildPlanWithTarget(inv, f.from, f.to, mode, f.targetID)
 	if err != nil {
 		return err
 	}
@@ -340,7 +352,7 @@ func runMigrate(args []string) error {
 		return err
 	}
 	if f.help {
-		fmt.Println("Usage: cursor-rebind migrate --from <old> --to <new> [--prefix] [--dry-run|--yes]")
+		fmt.Println("Usage: cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--dry-run|--yes]")
 		return nil
 	}
 	if f.from == "" || f.to == "" {
@@ -364,7 +376,7 @@ func runMigrate(args []string) error {
 	if f.prefix {
 		mode = rebind.ModePrefix
 	}
-	plan, err := rebind.BuildPlan(inv, f.from, f.to, mode)
+	plan, err := rebind.BuildPlanWithTarget(inv, f.from, f.to, mode, f.targetID)
 	if err != nil {
 		return err
 	}
@@ -380,7 +392,11 @@ func runMigrate(args []string) error {
 		fmt.Println("Quit Cursor, then re-run with --yes to apply.")
 		return nil
 	}
-	fmt.Printf("Done. Updated %d header(s).", res.HeadersUpdated)
+	fmt.Printf("Done. Updated %d header(s)", res.HeadersUpdated)
+	if res.HeadersAdded > 0 {
+		fmt.Printf(", added %d", res.HeadersAdded)
+	}
+	fmt.Printf(".")
 	if res.ProjectMoved {
 		fmt.Printf(" Agent project dir remapped.")
 	}
@@ -391,7 +407,60 @@ func runMigrate(args []string) error {
 	if res.TargetWSID != "" {
 		fmt.Printf("Target workspace id: %s\n", res.TargetWSID)
 	}
-	fmt.Println("Quit and reopen Cursor, then open the new project path.")
+	fmt.Println("Fully quit Cursor (not just reload), then reopen this project path.")
+	return nil
+}
+
+func runRepair(args []string) error {
+	f, _, err := parsePathFlags(args)
+	if err != nil {
+		return err
+	}
+	if f.help {
+		fmt.Println("Usage: cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] --yes")
+		return nil
+	}
+	if f.to == "" {
+		return fmt.Errorf("repair requires --to")
+	}
+	if !f.yes {
+		return fmt.Errorf("repair requires --yes (quit Cursor first)")
+	}
+	f.to = absPath(f.to)
+	if f.from == "" {
+		// Headers already on --to are enough; invent a non-equal from for BuildPlan.
+		f.from = f.to + ".__rebind_from_unknown"
+	} else {
+		f.from = absPath(f.from)
+	}
+
+	roots, err := paths.Discover()
+	if err != nil {
+		return err
+	}
+	inv, err := discover.Scan(roots)
+	if err != nil {
+		return err
+	}
+
+	plan, err := rebind.BuildPlanWithTarget(inv, f.from, f.to, rebind.ModeExact, f.targetID)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("cursor-rebind repair\n")
+	fmt.Printf("====================\n")
+	fmt.Printf("To:        %s\n", plan.To)
+	fmt.Printf("Target ID: %s\n", plan.TargetWSID)
+	if len(plan.SourceWSIDs) > 0 {
+		fmt.Printf("Sources:   %s\n", strings.Join(plan.SourceWSIDs, ", "))
+	}
+	fmt.Println()
+
+	if err := rebind.RepairTabs(inv, plan, f.yes); err != nil {
+		return err
+	}
+	fmt.Println("Done. Primary agent tab + Agents Window glass retagged.")
+	fmt.Println("Reopen this project path in Cursor.")
 	return nil
 }
 
