@@ -17,6 +17,19 @@ func TestEnrichTrackedGitReposAddsRepoURL(t *testing.T) {
 	if m["repoUrl"] != "github-rittus/interittus13/cursor-rebind" {
 		t.Fatalf("%v", m)
 	}
+	if _, ok := m["branches"]; !ok {
+		t.Fatalf("missing branches: %v", m)
+	}
+}
+
+func TestNormalizeTrackedGitReposAddsBranches(t *testing.T) {
+	in := []any{map[string]any{"repoPath": "/tmp/x"}}
+	out := normalizeTrackedGitRepos(in)
+	m := out[0].(map[string]any)
+	br, ok := m["branches"].([]any)
+	if !ok || br == nil {
+		t.Fatalf("branches=%v", m["branches"])
+	}
 }
 
 func TestRemapTrackedGitReposMergesFromIntoTo(t *testing.T) {

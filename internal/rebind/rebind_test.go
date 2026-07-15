@@ -61,9 +61,9 @@ func TestBuildPlanPrefersEmptyShellTarget(t *testing.T) {
 		},
 		Workspaces: []discover.Workspace{
 			// Data holder rewritten onto `to` (more composers would be discovered if DB existed).
-			{ID: "dataws", FolderPath: to, DBSize: 500, ModTime: mustParse("2026-07-14T15:00:00Z")},
+			{ID: "dataws", FolderPath: to, ModTime: mustParse("2026-07-14T15:00:00Z")},
 			// Empty shell Cursor minted for the renamed folder.
-			{ID: "shellws", FolderPath: to, DBSize: 10, ModTime: mustParse("2026-07-14T12:00:00Z")},
+			{ID: "shellws", FolderPath: to, ModTime: mustParse("2026-07-14T12:00:00Z")},
 		},
 	}
 	plan, err := rebind.BuildPlan(inv, from, to, rebind.ModeExact)

@@ -143,8 +143,9 @@ func inventoryPath(
 			if fp != "" && filepath.Clean(fp) == folder {
 				hit = true
 			}
-			// Basename match for leftover Agents Window labels ("mover").
-			if fp != "" && filepath.Base(filepath.Clean(fp)) == filepath.Base(folder) {
+			// Basename match for leftover Agents labels ("mover"); skip short names ("ai").
+			base := filepath.Base(folder)
+			if fp != "" && basenameLongEnough(base) && filepath.Base(filepath.Clean(fp)) == base {
 				hit = true
 			}
 		}

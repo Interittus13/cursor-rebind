@@ -46,7 +46,10 @@ func Create(note string) (id, absDir string, man *Manifest, err error) {
 	return id, absDir, man, nil
 }
 
-// CopyFile copies src into the backup dir as name and records it in the manifest.
+// CopyFile copies src into the backup dir and records it in the manifest.
+// When logical is non-empty it is used as the relative destination path under
+// backupDir (e.g. "global/state.vscdb", "ws/<id>/state.vscdb") so multiple
+// state.vscdb copies do not overwrite each other. Empty logical keeps basename.
 func CopyFile(backupDir string, man *Manifest, logical, src string) error {
 	if _, err := os.Stat(src); err != nil {
 		if os.IsNotExist(err) {
@@ -56,13 +59,8 @@ func CopyFile(backupDir string, man *Manifest, logical, src string) error {
 	}
 	dstName := filepath.Base(src)
 	if logical != "" {
-		dstName = logical + filepath.Ext(src)
-		if filepath.Ext(src) == "" {
-			dstName = logical
-		}
+		dstName = logical
 	}
-	// Keep unique names for sidecars.
-	dstName = filepath.Base(src)
 	dst := filepath.Join(backupDir, dstName)
 	if err := copyFile(src, dst); err != nil {
 		return err

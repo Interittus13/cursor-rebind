@@ -95,12 +95,23 @@ func glassKeyPrefixes(wsID string) []string {
 }
 
 // glassTransferPrefixes are keys that should move (not only delete) when retiring
-// a source workspace id onto the target.
+// a source workspace id onto the target. Subset of glassKeyPrefixes (viewState is
+// discarded rather than transferred).
 func glassTransferPrefixes(wsID string) []string {
-	return []string{
-		"cursor/glass.tabs.v2/" + wsID,
-		"agentData.cacheStorage.agentEnvironment.slashMenuItems.v2.local.glass." + wsID,
+	var out []string
+	for _, p := range glassKeyPrefixes(wsID) {
+		if strings.HasPrefix(p, "cursor/glass.fileTab.viewState/") {
+			continue
+		}
+		out = append(out, p)
 	}
+	return out
+}
+
+// basenameLongEnough is the shared heuristic for basename-only path matching.
+// Short names like "ai" are too ambiguous to treat as identity.
+func basenameLongEnough(name string) bool {
+	return len(name) >= 4
 }
 
 func listItemKeysExactOrLike(db *sql.DB, prefix string) ([]string, error) {

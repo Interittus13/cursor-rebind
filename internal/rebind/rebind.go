@@ -65,6 +65,7 @@ type Result struct {
 	GlassProjectsUpdated int    `json:"glassProjectsUpdated"`
 	GlassKeysMoved       int    `json:"glassKeysMoved"`
 	ProjectMoved         bool   `json:"projectMoved"`
+	TranscriptsWritten   int    `json:"transcriptsWritten,omitempty"`
 	TargetWSID           string `json:"targetWorkspaceId"`
 }
 
@@ -241,6 +242,10 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 				})
 			}
 		}
+		p.Ops = append(p.Ops, Op{
+			Kind:   "rewrite-composer-data",
+			Detail: "Agents: set composerData.workspaceIdentifier + trackedGitRepos paths/repoUrl on --to",
+		})
 		switch p.Strategy {
 		case StrategyMerge:
 			p.Ops = append(p.Ops, Op{
@@ -265,6 +270,10 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 		p.Ops = append(p.Ops, Op{
 			Kind:   "detach-orphan-workspaces",
 			Detail: "point leftover workspaceStorage folders away from the target path so Cursor opens one identity",
+		})
+		p.Ops = append(p.Ops, Op{
+			Kind:   "retire-source-identity",
+			Detail: "retire leftover --from workspaces, workspaceMetadata, recently-opened, and stub agent project dirs",
 		})
 		// Do NOT rewrite source workspace.json to the target path (creates duplicate identities).
 	} else {
@@ -386,11 +395,13 @@ func findSourceWorkspaceIDs(inv *discover.Inventory, from, to, targetID string, 
 				add(w.ID)
 			}
 		}
-		// Basename match for odd leftovers.
+		// Basename match for odd leftovers (skip short names like "ai").
 		base := filepath.Base(from)
-		for _, w := range inv.Workspaces {
-			if w.FolderPath != "" && filepath.Base(filepath.Clean(w.FolderPath)) == base {
-				add(w.ID)
+		if basenameLongEnough(base) {
+			for _, w := range inv.Workspaces {
+				if w.FolderPath != "" && filepath.Base(filepath.Clean(w.FolderPath)) == base {
+					add(w.ID)
+				}
 			}
 		}
 		for _, e := range inv.Headers.Entries {
@@ -716,14 +727,20 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 	res.BackupID = id
 
 	global := inv.Roots.GlobalDB
-	for _, side := range []string{global, global + "-wal", global + "-shm"} {
-		_ = backup.CopyFile(bdir, man, "", side)
+	for _, side := range []struct {
+		logical, src string
+	}{
+		{"global/state.vscdb", global},
+		{"global/state.vscdb-wal", global + "-wal"},
+		{"global/state.vscdb-shm", global + "-shm"},
+	} {
+		_ = backup.CopyFile(bdir, man, side.logical, side.src)
 	}
 	for _, sid := range plan.SourceWSIDs {
-		_ = backup.CopyFile(bdir, man, "", filepath.Join(inv.Roots.WorkspaceStorage, sid, "state.vscdb"))
+		_ = backup.CopyFile(bdir, man, "ws/"+sid+"/state.vscdb", filepath.Join(inv.Roots.WorkspaceStorage, sid, "state.vscdb"))
 	}
 	if plan.TargetWSID != "" {
-		_ = backup.CopyFile(bdir, man, "", filepath.Join(inv.Roots.WorkspaceStorage, plan.TargetWSID, "state.vscdb"))
+		_ = backup.CopyFile(bdir, man, "ws/"+plan.TargetWSID+"/state.vscdb", filepath.Join(inv.Roots.WorkspaceStorage, plan.TargetWSID, "state.vscdb"))
 	}
 	if plan.Mode == ModeExact && plan.ProjectExists {
 		src := filepath.Join(inv.Roots.ProjectsDir, plan.ProjectFrom)
@@ -744,43 +761,86 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 		if err := rewriteWorkspaceJSON(inv.Roots.WorkspaceStorage, plan); err != nil {
 			return nil, fmt.Errorf("workspace.json: %w", err)
 		}
+		moved, err := rewriteProjects(inv.Roots.ProjectsDir, plan)
+		if err != nil {
+			return nil, fmt.Errorf("projects: %w", err)
+		}
+		res.ProjectMoved = moved
+		if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
+			return nil, fmt.Errorf("normalize storage text: %w", err)
+		}
 	} else {
-		n, err := rewriteComposerDiskPaths(inv.Roots.GlobalDB, plan)
+		idRes, err := applyExactIdentity(inv, plan, exactIdentityOpts{rewriteProjects: true})
 		if err != nil {
-			return nil, fmt.Errorf("composer disk paths: %w", err)
+			return nil, err
 		}
-		res.ComposersRewritten = n
-		primary, err := transferWorkspaceTabsPrimary(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan)
-		if err != nil {
-			return nil, fmt.Errorf("transfer tabs: %w", err)
-		}
-		gp, gk, err := rewriteGlassAgentIdentity(inv.Roots.GlobalDB, plan, primary)
-		if err != nil {
-			return nil, fmt.Errorf("glass agent identity: %w", err)
-		}
-		res.GlassProjectsUpdated = gp
-		res.GlassKeysMoved = gk
-		if err := detachOrphanWorkspaces(inv.Roots.WorkspaceStorage, plan); err != nil {
-			return nil, fmt.Errorf("detach orphans: %w", err)
-		}
-		if err := retireSourceIdentity(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, inv.Roots.ProjectsDir, plan); err != nil {
-			return nil, fmt.Errorf("retire source identity: %w", err)
-		}
-	}
-
-	moved, err := rewriteProjects(inv.Roots.ProjectsDir, plan)
-	if err != nil {
-		return nil, fmt.Errorf("projects: %w", err)
-	}
-	res.ProjectMoved = moved
-
-	// Cursor ItemTable must be SQLITE TEXT. Our older builds wrote BLOBs, and
-	// Electron then JSON.parses Uint8Arrays as "123,34,…" (crash at position 3).
-	if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
-		return nil, fmt.Errorf("normalize storage text: %w", err)
+		res.ComposersRewritten = idRes.ComposersRewritten
+		res.GlassProjectsUpdated = idRes.GlassProjectsUpdated
+		res.GlassKeysMoved = idRes.GlassKeysMoved
+		res.ProjectMoved = idRes.ProjectMoved
+		res.TranscriptsWritten = idRes.TranscriptsWritten
 	}
 
 	return res, nil
+}
+
+type exactIdentityOpts struct {
+	// rewriteProjects moves/merges ~/.cursor/projects (migrate only; repair skips).
+	rewriteProjects bool
+}
+
+type exactIdentityResult struct {
+	PrimaryComposerID    string
+	ComposersRewritten   int
+	GlassProjectsUpdated int
+	GlassKeysMoved       int
+	ProjectMoved         bool
+	TranscriptsWritten   int
+}
+
+// applyExactIdentity runs the exact-mode identity pass shared by Apply and RepairTabs.
+func applyExactIdentity(inv *discover.Inventory, plan *Plan, opts exactIdentityOpts) (*exactIdentityResult, error) {
+	out := &exactIdentityResult{}
+	n, err := rewriteComposerDiskPaths(inv.Roots.GlobalDB, plan)
+	if err != nil {
+		return nil, fmt.Errorf("composer disk paths: %w", err)
+	}
+	out.ComposersRewritten = n
+	primary, err := transferWorkspaceTabsPrimary(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan)
+	if err != nil {
+		return nil, fmt.Errorf("transfer tabs: %w", err)
+	}
+	out.PrimaryComposerID = primary
+	gp, gk, err := rewriteGlassAgentIdentity(inv.Roots.GlobalDB, plan, primary)
+	if err != nil {
+		return nil, fmt.Errorf("glass agent identity: %w", err)
+	}
+	out.GlassProjectsUpdated = gp
+	out.GlassKeysMoved = gk
+	if err := detachOrphanWorkspaces(inv.Roots.WorkspaceStorage, plan); err != nil {
+		return nil, fmt.Errorf("detach orphans: %w", err)
+	}
+	if opts.rewriteProjects {
+		// Move/merge ~/.cursor/projects before retireSourceIdentity — retirement
+		// may delete the --from project slug as a stub and would break rewriteProjects.
+		moved, err := rewriteProjects(inv.Roots.ProjectsDir, plan)
+		if err != nil {
+			return nil, fmt.Errorf("projects: %w", err)
+		}
+		out.ProjectMoved = moved
+	}
+	if err := retireSourceIdentity(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, inv.Roots.ProjectsDir, plan); err != nil {
+		return nil, fmt.Errorf("retire source identity: %w", err)
+	}
+	tn, err := ensureAgentTranscripts(inv.Roots.GlobalDB, plan)
+	if err != nil {
+		return nil, fmt.Errorf("agent transcripts: %w", err)
+	}
+	out.TranscriptsWritten = tn
+	if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
+		return nil, fmt.Errorf("normalize storage text: %w", err)
+	}
+	return out, nil
 }
 
 func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, err error) {
@@ -831,6 +891,8 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 			continue
 		}
 		// Do not promote empty "New Agent" stubs onto the target identity.
+		// Leave them for the pass below — dropping source-side stubs clears the
+		// leftover --from path from Agents Window / sidebar.
 		if composerIsEmpty(db, c.ComposerID, c.Name) {
 			continue
 		}
@@ -840,6 +902,10 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 		if plan.Mode == ModeExact {
 			c.WorkspaceIdentifier.ID = plan.TargetWSID
 			c.WorkspaceIdentifier.URI = targetURI
+			// Agents Window hydrates history for agent-mode chats only.
+			if c.UnifiedMode == "" || c.UnifiedMode == "chat" {
+				c.UnifiedMode = "agent"
+			}
 		} else {
 			fp := uriFsPath(c.WorkspaceIdentifier.URI)
 			newPath := rewritePath(fp, plan.From, plan.To, plan.Mode)
@@ -870,10 +936,19 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 				if c.WorkspaceIdentifier.ID != plan.TargetWSID {
 					c.WorkspaceIdentifier.ID = plan.TargetWSID
 					c.WorkspaceIdentifier.URI = targetURI
+					if c.UnifiedMode == "" || c.UnifiedMode == "chat" {
+						c.UnifiedMode = "agent"
+					}
 					updated++
 				} else if c.WorkspaceIdentifier.URI == nil ||
 					filepath.Clean(uriFsPath(c.WorkspaceIdentifier.URI)) != filepath.Clean(plan.To) {
 					c.WorkspaceIdentifier.URI = targetURI
+					if c.UnifiedMode == "" || c.UnifiedMode == "chat" {
+						c.UnifiedMode = "agent"
+					}
+					updated++
+				} else if c.UnifiedMode == "" || c.UnifiedMode == "chat" {
+					c.UnifiedMode = "agent"
 					updated++
 				}
 			}
@@ -893,13 +968,29 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 		added++
 	}
 
-	// Drop empty stub headers that already point at the target (or leftover from bad migrates).
+	// Drop empty stub headers on --to (cleanup) and on --from (otherwise Agents
+	// keeps an "old path" bucket forever — rewrite skips promoting empty stubs).
 	removed := 0
-	if plan.Mode == ModeExact && plan.TargetWSID != "" {
+	if plan.Mode == ModeExact {
 		filtered := make([]vscdb.ComposerMeta, 0, len(headers.AllComposers))
 		for _, c := range headers.AllComposers {
-			if c.WorkspaceIdentifier != nil && c.WorkspaceIdentifier.ID == plan.TargetWSID &&
-				composerIsEmpty(db, c.ComposerID, c.Name) {
+			if !composerIsEmpty(db, c.ComposerID, c.Name) {
+				filtered = append(filtered, c)
+				continue
+			}
+			onTarget := c.WorkspaceIdentifier != nil && c.WorkspaceIdentifier.ID == plan.TargetWSID
+			onSource := false
+			if c.WorkspaceIdentifier != nil {
+				if c.WorkspaceIdentifier.ID != "" && sourceSet[c.WorkspaceIdentifier.ID] {
+					onSource = true
+				}
+				if fp := uriFsPath(c.WorkspaceIdentifier.URI); fp != "" {
+					if matches(fp, plan.From, plan.Mode) || filepath.Clean(fp) == filepath.Clean(plan.From) {
+						onSource = true
+					}
+				}
+			}
+			if onTarget || onSource {
 				removed++
 				continue
 			}
@@ -908,12 +999,256 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 		headers.AllComposers = filtered
 	}
 	if updated == 0 && added == 0 && removed == 0 {
+		// Still sync the Agents Window table — it can lag behind ItemTable.
+		if err := syncComposerHeadersTable(db, plan, headers.AllComposers, sourceSet); err != nil {
+			return 0, 0, err
+		}
 		return 0, 0, nil
 	}
 	if err := vscdb.SetItemJSON(db, "composer.composerHeaders", headers); err != nil {
 		return updated, added, err
 	}
+	// Cursor 3 Agents Window reads the dedicated composerHeaders SQL table, not
+	// only ItemTable["composer.composerHeaders"]. Leaving that table on --from
+	// is why IDE chats load while Agents still shows /home/ulap177/... paths.
+	if err := syncComposerHeadersTable(db, plan, headers.AllComposers, sourceSet); err != nil {
+		return updated, added, err
+	}
 	return updated, added, nil
+}
+
+// syncComposerHeadersTable updates/deletes rows in the composerHeaders table so
+// Agents Window matches ItemTable. Safe no-op when the table is absent.
+func syncComposerHeadersTable(db *sql.DB, plan *Plan, keep []vscdb.ComposerMeta, sourceSet map[string]bool) error {
+	var name string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='composerHeaders'`).Scan(&name)
+	if err == sql.ErrNoRows || name == "" {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	keepIDs := map[string]vscdb.ComposerMeta{}
+	for _, c := range keep {
+		if c.ComposerID != "" {
+			keepIDs[c.ComposerID] = c
+		}
+	}
+
+	rows, err := db.Query(`SELECT composerId, workspaceId, value FROM composerHeaders`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type row struct {
+		id, wid, val string
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.wid, &r.val); err != nil {
+			return err
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	targetURI := buildURI(plan.To)
+	for _, r := range all {
+		meta, ok := keepIDs[r.id]
+		if !ok {
+			// Drop empty/source stubs removed from ItemTable, or orphans still on --from.
+			drop := sourceSet[r.wid] || r.wid == ""
+			if !drop && r.val != "" {
+				var blob map[string]any
+				if json.Unmarshal([]byte(r.val), &blob) == nil {
+					if wi, _ := blob["workspaceIdentifier"].(map[string]any); wi != nil {
+						if id, _ := wi["id"].(string); sourceSet[id] {
+							drop = true
+						}
+						if uri, _ := wi["uri"].(map[string]any); uri != nil {
+							fp := mapFsPath(uri)
+							if fp != "" && (matches(fp, plan.From, plan.Mode) || filepath.Clean(fp) == filepath.Clean(plan.From)) {
+								drop = true
+							}
+						}
+					}
+				}
+			}
+			if drop && composerIsEmpty(db, r.id, "") {
+				if _, err := db.Exec(`DELETE FROM composerHeaders WHERE composerId = ?`, r.id); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		// Ensure kept chats bind to --to in the Agents table without clobbering
+		// richer fields stored only in this table (unread, checkpoint, etc.).
+		//
+		// Cold-start bug: Agents Window paints from this SQL table first. If the
+		// row still has --from (e.g. mover) while ItemTable/composerData already
+		// say --to (cursor-rebind), the chat flashes under the old folder then
+		// jumps after composerData loads. Always reconcile SQL → --to when the
+		// ItemTable header belongs to this migrate.
+		wid := r.wid
+		val := r.val
+		needWrite := false
+		if plan.Mode == ModeExact && plan.TargetWSID != "" {
+			fromSlash := filepath.ToSlash(filepath.Clean(plan.From))
+			fromClean := filepath.Clean(plan.From)
+			toClean := filepath.Clean(plan.To)
+			onSource := sourceSet[wid]
+			if !onSource && r.val != "" {
+				if strings.Contains(r.val, fromSlash) || strings.Contains(r.val, fromClean) {
+					onSource = true
+				}
+			}
+			metaOnTarget := false
+			if meta.WorkspaceIdentifier != nil {
+				if meta.WorkspaceIdentifier.ID == plan.TargetWSID {
+					metaOnTarget = true
+				}
+				if fp := uriFsPath(meta.WorkspaceIdentifier.URI); fp != "" && filepath.Clean(fp) == toClean {
+					metaOnTarget = true
+				}
+			}
+			sqlMismatch := metaOnTarget && (wid != plan.TargetWSID || onSource)
+			if onSource || sqlMismatch || (metaOnTarget && wid != plan.TargetWSID) {
+				wid = plan.TargetWSID
+				needWrite = true
+			}
+			if onSource || sqlMismatch || wid == plan.TargetWSID || metaOnTarget {
+				patched, changed, err := patchComposerHeaderValueWorkspace(r.val, plan.TargetWSID, plan.To)
+				if err != nil {
+					return err
+				}
+				if changed {
+					val = patched
+					needWrite = true
+				} else if wid != r.wid {
+					// Column alone was wrong; keep value but rewrite workspaceId.
+					needWrite = true
+				}
+			}
+		}
+		if !needWrite {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE composerHeaders SET workspaceId = ?, value = ? WHERE composerId = ?`, wid, val, r.id); err != nil {
+			return err
+		}
+		_ = ensureGlassAgentTabState(db, plan, r.id)
+	}
+
+	// Upsert any ItemTable composers missing from the Agents table.
+	for id, meta := range keepIDs {
+		var exists int
+		_ = db.QueryRow(`SELECT COUNT(1) FROM composerHeaders WHERE composerId = ?`, id).Scan(&exists)
+		if exists > 0 {
+			continue
+		}
+		if meta.WorkspaceIdentifier == nil && plan.Mode == ModeExact {
+			meta.WorkspaceIdentifier = &vscdb.WorkspaceIdentifier{ID: plan.TargetWSID, URI: targetURI}
+		}
+		raw, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		wid := plan.TargetWSID
+		if meta.WorkspaceIdentifier != nil && meta.WorkspaceIdentifier.ID != "" {
+			wid = meta.WorkspaceIdentifier.ID
+		}
+		_, err = db.Exec(`INSERT INTO composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value)
+			VALUES(?, ?, ?, ?, 0, 0, ?, ?, ?)`,
+			id, wid, meta.CreatedAt, meta.LastUpdatedAt, meta.LastUpdatedAt, meta.LastUpdatedAt, string(raw))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func patchComposerHeaderValueWorkspace(raw, targetID, toPath string) (string, bool, error) {
+	if raw == "" {
+		return raw, false, nil
+	}
+	var blob map[string]any
+	if err := json.Unmarshal([]byte(raw), &blob); err != nil {
+		return raw, false, nil
+	}
+	uri := workspaceURIMap(toPath)
+	wi, _ := blob["workspaceIdentifier"].(map[string]any)
+	changed := false
+	if wi == nil {
+		blob["workspaceIdentifier"] = map[string]any{"id": targetID, "uri": uri}
+		changed = true
+	} else {
+		if id, _ := wi["id"].(string); id != targetID {
+			wi["id"] = targetID
+			changed = true
+		}
+		if prev, _ := wi["uri"].(map[string]any); prev == nil || mapFsPath(prev) != filepath.Clean(toPath) {
+			wi["uri"] = uri
+			changed = true
+		}
+		blob["workspaceIdentifier"] = wi
+	}
+	// Promote chat → agent so Agents Window hydrates the conversation.
+	if um, _ := blob["unifiedMode"].(string); um != "agent" {
+		blob["unifiedMode"] = "agent"
+		changed = true
+	}
+	if fm, _ := blob["forceMode"].(string); fm == "" || fm == "chat" {
+		blob["forceMode"] = "edit"
+		changed = true
+	}
+	// Agents repo grouping uses trackedGitRepos on the header row.
+	// Must include branches:[] — glass does entry.branches.map without null checks.
+	repos := normalizeTrackedGitRepos(blob["trackedGitRepos"])
+	if len(repos) == 0 {
+		repos = []any{map[string]any{"repoPath": filepath.Clean(toPath), "branches": []any{}}}
+		changed = true
+	} else {
+		before, _ := json.Marshal(blob["trackedGitRepos"])
+		after, _ := json.Marshal(repos)
+		if string(before) != string(after) {
+			changed = true
+		}
+	}
+	blob["trackedGitRepos"] = repos
+	if !changed {
+		return raw, false, nil
+	}
+	out, err := json.Marshal(blob)
+	if err != nil {
+		return raw, false, err
+	}
+	return string(out), true, nil
+}
+
+// ensureGlassAgentTabState creates the per-agent glass tabs key Agents expects
+// when opening a migrated chat (missing on chats that only lived in IDE).
+func ensureGlassAgentTabState(db *sql.DB, plan *Plan, composerID string) error {
+	if plan == nil || plan.TargetWSID == "" || composerID == "" {
+		return nil
+	}
+	key := "cursor/glass.tabs.v2/" + plan.TargetWSID + "/" + composerID + "/state.json"
+	if _, ok, _ := vscdb.GetItemRaw(db, key); ok {
+		return nil
+	}
+	body := map[string]any{
+		"version":             1,
+		"agentId":             composerID,
+		"browserTabs":         []any{},
+		"tabOrder":            []any{},
+		"rememberedAppTabIds": map[string]any{},
+	}
+	return vscdb.SetItemJSON(db, key, body)
 }
 
 func transcriptComposerIDs(plan *Plan) []string {
@@ -1431,6 +1766,10 @@ func rewriteProjects(projectsDir string, plan *Plan) (bool, error) {
 		}
 		src := filepath.Join(projectsDir, plan.ProjectFrom)
 		dst := filepath.Join(projectsDir, plan.ProjectTo)
+		if _, err := os.Stat(src); err != nil {
+			// Already retired/merged earlier, or never present at apply time.
+			return false, nil
+		}
 		if _, err := os.Stat(dst); err == nil {
 			if err := mergeDir(src, dst); err != nil {
 				return false, err
@@ -1555,14 +1894,18 @@ func randomID() (string, error) {
 
 // RepairResult is the outcome of RepairTabs.
 type RepairResult struct {
+	BackupID             string
 	PrimaryComposerID    string
 	ComposersRewritten   int
 	GlassProjectsUpdated int
 	GlassKeysMoved       int
+	TranscriptsWritten   int
 }
 
-// RepairTabs rebinds the IDE open-tab / Agents Window identity for an already-migrated
-// target without rewriting headers again. Cursor must be fully quit.
+// RepairTabs rebinds IDE open-tab + Agents Window identity after a partial migrate.
+// Unlike Apply, it does not require contentful chats still sitting on --from — it
+// still rewrites headers (to drop empty --from stubs), composerData, glass, and
+// retires leftover --from Agents roots that keep showing the old machine path.
 func RepairTabs(inv *discover.Inventory, plan *Plan, yes bool) (*RepairResult, error) {
 	if plan == nil {
 		return nil, fmt.Errorf("nil plan")
@@ -1579,32 +1922,39 @@ func RepairTabs(inv *discover.Inventory, plan *Plan, yes bool) (*RepairResult, e
 	if err := guard.EnsureCursorClosed(); err != nil {
 		return nil, err
 	}
-	n, err := rewriteComposerDiskPaths(inv.Roots.GlobalDB, plan)
+
+	id, bdir, man, err := backup.Create(fmt.Sprintf("repair %s → %s", plan.From, plan.To))
 	if err != nil {
-		return nil, fmt.Errorf("repair composer disk paths: %w", err)
+		return nil, fmt.Errorf("backup: %w", err)
 	}
-	primary, err := transferWorkspaceTabsPrimary(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan)
+	_ = backup.CopyFile(bdir, man, "global/state.vscdb", inv.Roots.GlobalDB)
+	for _, sid := range plan.SourceWSIDs {
+		_ = backup.CopyFile(bdir, man, "ws/"+sid+"/state.vscdb", filepath.Join(inv.Roots.WorkspaceStorage, sid, "state.vscdb"))
+	}
+	if plan.TargetWSID != "" {
+		_ = backup.CopyFile(bdir, man, "ws/"+plan.TargetWSID+"/state.vscdb", filepath.Join(inv.Roots.WorkspaceStorage, plan.TargetWSID, "state.vscdb"))
+	}
+	if err := backup.WriteManifest(bdir, man); err != nil {
+		return nil, fmt.Errorf("backup manifest: %w", err)
+	}
+
+	// Drop empty --from stubs + retag any leftover headers. Skipping this left
+	// Agents Window permanently bound to /home/ulap177/.../ai via a ghost header
+	// even when the real chat already pointed at --to (IDE worked, Agents empty).
+	if _, _, err := rewriteHeaders(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
+		return nil, fmt.Errorf("repair headers: %w", err)
+	}
+	idRes, err := applyExactIdentity(inv, plan, exactIdentityOpts{rewriteProjects: false})
 	if err != nil {
-		return nil, fmt.Errorf("repair tabs: %w", err)
-	}
-	gp, gk, err := rewriteGlassAgentIdentity(inv.Roots.GlobalDB, plan, primary)
-	if err != nil {
-		return nil, fmt.Errorf("repair glass: %w", err)
-	}
-	if err := detachOrphanWorkspaces(inv.Roots.WorkspaceStorage, plan); err != nil {
-		return nil, fmt.Errorf("repair detach orphans: %w", err)
-	}
-	if err := retireSourceIdentity(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, inv.Roots.ProjectsDir, plan); err != nil {
-		return nil, fmt.Errorf("repair retire source: %w", err)
-	}
-	if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
-		return nil, fmt.Errorf("repair normalize: %w", err)
+		return nil, fmt.Errorf("repair: %w", err)
 	}
 	return &RepairResult{
-		PrimaryComposerID:    primary,
-		ComposersRewritten:   n,
-		GlassProjectsUpdated: gp,
-		GlassKeysMoved:       gk,
+		BackupID:             id,
+		PrimaryComposerID:    idRes.PrimaryComposerID,
+		ComposersRewritten:   idRes.ComposersRewritten,
+		GlassProjectsUpdated: idRes.GlassProjectsUpdated,
+		GlassKeysMoved:       idRes.GlassKeysMoved,
+		TranscriptsWritten:   idRes.TranscriptsWritten,
 	}, nil
 }
 

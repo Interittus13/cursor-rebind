@@ -54,32 +54,34 @@ func rewriteGlassLocalProjects(db *sql.DB, plan *Plan) (int, error) {
 		return 0, nil
 	}
 
-	memberHit := collectGlassMemberHits(db, plan)
 	sourceSet := toSet(plan.SourceWSIDs)
 	targetURI := workspaceURIMap(plan.To)
+	toClean := filepath.Clean(plan.To)
 	changed := 0
 	for _, p := range projects {
 		ws, _ := p["workspace"].(map[string]any)
 		if ws == nil {
 			continue
 		}
+		// Retag only projects whose workspace already belongs to this migrate.
+		// Never retag a shared glass project solely because a member composer is
+		// in the migrate set — that steals foreign chats (e.g. cursor-rebind)
+		// when migrating a different folder (e.g. ai).
 		hit := false
-		if id, _ := p["id"].(string); id != "" && memberHit[id] {
-			hit = true
-		}
 		if id, _ := ws["id"].(string); id != "" && (sourceSet[id] || id == plan.TargetWSID) {
 			hit = true
 		}
 		if uri, _ := ws["uri"].(map[string]any); uri != nil {
 			if fp := mapFsPath(uri); fp != "" {
 				clean := filepath.Clean(fp)
-				if matches(clean, plan.From, plan.Mode) || (plan.Mode == ModeExact && clean == filepath.Clean(plan.To)) {
+				if matches(clean, plan.From, plan.Mode) || (plan.Mode == ModeExact && clean == toClean) {
 					hit = true
 				}
 				if glassProjectMatchesFrom(clean, plan.From, plan.Mode) {
 					hit = true
 				}
-				if strings.Contains(clean, ".__rebind_orphan_") {
+				if strings.Contains(clean, ".__rebind_orphan_") &&
+					glassProjectMatchesFrom(strings.Split(clean, ".__rebind_orphan_")[0], plan.From, plan.Mode) {
 					hit = true
 				}
 			}
@@ -92,6 +94,22 @@ func rewriteGlassLocalProjects(db *sql.DB, plan *Plan) (int, error) {
 		p["workspace"] = ws
 		changed++
 	}
+
+	// Re-home migrate members that still sit in a foreign glass project.
+	n, err := ensureGlassMembershipForPlan(db, plan, &projects)
+	if err != nil {
+		return changed, err
+	}
+	changed += n
+
+	// Drop empty --from stubs from membership so they cannot pull the shared
+	// project back onto the old machine path in Agents Window.
+	if n, err := purgeGlassEmptySourceMembers(db, plan); err != nil {
+		return changed, err
+	} else {
+		changed += n
+	}
+
 	if changed == 0 {
 		return 0, nil
 	}
@@ -101,61 +119,284 @@ func rewriteGlassLocalProjects(db *sql.DB, plan *Plan) (int, error) {
 	return changed, nil
 }
 
-func collectGlassMemberHits(db *sql.DB, plan *Plan) map[string]bool {
-	memberHit := map[string]bool{}
-	mraw, mok, _ := vscdb.GetItemRaw(db, "glass.localAgentProjectMembership.v1")
-	if !mok {
-		return memberHit
+// purgeGlassEmptySourceMembers removes membership rows for empty stubs whose
+// headers still (or recently) advertised --from / source workspace ids.
+func purgeGlassEmptySourceMembers(db *sql.DB, plan *Plan) (int, error) {
+	mraw, mok, err := vscdb.GetItemRaw(db, "glass.localAgentProjectMembership.v1")
+	if err != nil || !mok {
+		return 0, err
 	}
 	var mem map[string]string
 	if json.Unmarshal(mraw, &mem) != nil {
-		return memberHit
+		return 0, nil
 	}
-	mark := func(cid string) {
-		if pid := mem[cid]; pid != "" {
-			memberHit[pid] = true
+	headers := loadHeaderMap(db)
+	sourceSet := toSet(plan.SourceWSIDs)
+	changed := 0
+	for cid := range mem {
+		h, ok := headers[cid]
+		empty := composerIsEmpty(db, cid, h.Name)
+		if !empty {
+			continue
 		}
-	}
-	for _, cid := range transcriptComposerIDs(plan) {
-		mark(cid)
-	}
-	for _, cid := range plan.SourceInventory.AgentComposerIDs {
-		mark(cid)
-	}
-	for _, cid := range plan.SourceInventory.IDEComposerIDs {
-		mark(cid)
-	}
-	var headers vscdb.ComposerHeaders
-	if ok, _ := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers); ok {
-		sourceSet := toSet(plan.SourceWSIDs)
-		for _, c := range headers.AllComposers {
-			if !headerHitsPlan(c, plan, sourceSet) {
-				continue
+		drop := false
+		if !ok {
+			// Orphan membership with no header — leave alone unless composerData
+			// is clearly on --from.
+			if composerDataMentionsFrom(db, cid, plan) {
+				drop = true
 			}
-			mark(c.ComposerID)
+		} else if h.WorkspaceIdentifier != nil {
+			if sourceSet[h.WorkspaceIdentifier.ID] {
+				drop = true
+			}
+			if fp := uriFsPath(h.WorkspaceIdentifier.URI); fp != "" &&
+				(matches(fp, plan.From, plan.Mode) || filepath.Clean(fp) == filepath.Clean(plan.From)) {
+				drop = true
+			}
+			if h.WorkspaceIdentifier.ID == plan.TargetWSID {
+				drop = true // empty stub on --to
+			}
+		}
+		if drop {
+			delete(mem, cid)
+			changed++
 		}
 	}
-	if sel, ok, _ := vscdb.GetItemRaw(db, "cursor/glass.selectedAgent"); ok {
-		cid := strings.Trim(strings.TrimSpace(string(sel)), `"`)
-		mark(cid)
+	if changed == 0 {
+		return 0, nil
 	}
-	return memberHit
+	if err := vscdb.SetItemJSON(db, "glass.localAgentProjectMembership.v1", mem); err != nil {
+		return changed, err
+	}
+	return changed, nil
 }
 
-func headerHitsPlan(c vscdb.ComposerMeta, plan *Plan, sourceSet map[string]bool) bool {
-	if c.WorkspaceIdentifier == nil {
-		return false
+// ensureGlassMembershipForPlan moves composers that belong to this migrate onto
+// a glass local project whose workspace is --to, creating one if needed.
+func ensureGlassMembershipForPlan(db *sql.DB, plan *Plan, projects *[]map[string]any) (int, error) {
+	mraw, mok, err := vscdb.GetItemRaw(db, "glass.localAgentProjectMembership.v1")
+	if err != nil || !mok {
+		return 0, err
 	}
-	if sourceSet[c.WorkspaceIdentifier.ID] || c.WorkspaceIdentifier.ID == plan.TargetWSID {
-		return true
+	var mem map[string]string
+	if json.Unmarshal(mraw, &mem) != nil {
+		return 0, nil
 	}
-	fp := uriFsPath(c.WorkspaceIdentifier.URI)
-	if fp == "" {
-		return false
+	byID := map[string]map[string]any{}
+	for _, p := range *projects {
+		if id, _ := p["id"].(string); id != "" {
+			byID[id] = p
+		}
 	}
-	return matches(fp, plan.From, plan.Mode) ||
-		filepath.Clean(fp) == filepath.Clean(plan.To) ||
-		glassProjectMatchesFrom(fp, plan.From, plan.Mode)
+	headers := loadHeaderMap(db)
+	targetURI := workspaceURIMap(plan.To)
+	changed := 0
+
+	needProject := func() string {
+		pid := dedicatedGlassProjectID(plan)
+		for i, p := range *projects {
+			if id, _ := p["id"].(string); id == pid {
+				ws, _ := p["workspace"].(map[string]any)
+				if ws == nil {
+					ws = map[string]any{}
+				}
+				ws["id"] = plan.TargetWSID
+				ws["uri"] = targetURI
+				(*projects)[i]["workspace"] = ws
+				(*projects)[i]["name"] = filepath.Base(plan.To)
+				return pid
+			}
+		}
+		*projects = append(*projects, map[string]any{
+			"id":   pid,
+			"name": filepath.Base(plan.To),
+			"workspace": map[string]any{
+				"id":  plan.TargetWSID,
+				"uri": targetURI,
+			},
+		})
+		return pid
+	}
+
+	for _, cid := range composersNeedingGlassTo(plan, headers) {
+		want := dedicatedGlassProjectID(plan)
+		if mem[cid] == want {
+			continue
+		}
+		pid := needProject()
+		if mem[cid] != pid {
+			mem[cid] = pid
+			changed++
+		}
+		byID = map[string]map[string]any{}
+		for _, p := range *projects {
+			if id, _ := p["id"].(string); id != "" {
+				byID[id] = p
+			}
+		}
+	}
+	// Kick foreign chats off --to glass projects (stuck after a chat-named
+	// project was reused for workspace retags).
+	if n := scrubForeignGlassMembers(plan, mem, byID, headers, projects); n > 0 {
+		changed += n
+	}
+	if changed == 0 {
+		return 0, nil
+	}
+	if err := vscdb.SetItemJSON(db, "glass.localAgentProjectMembership.v1", mem); err != nil {
+		return changed, err
+	}
+	return changed, nil
+}
+
+func dedicatedGlassProjectID(plan *Plan) string {
+	if plan == nil || plan.TargetWSID == "" {
+		return ""
+	}
+	pid := "rebind-" + plan.TargetWSID
+	if len(pid) > 48 {
+		pid = pid[:48]
+	}
+	return pid
+}
+
+// scrubForeignGlassMembers moves chats that do not belong to this migrate off
+// any glass project retagged onto --to (keeps cursor-rebind chats etc. intact).
+func scrubForeignGlassMembers(
+	plan *Plan,
+	mem map[string]string,
+	byID map[string]map[string]any,
+	headers map[string]vscdb.ComposerMeta,
+	projects *[]map[string]any,
+) int {
+	if plan == nil || mem == nil {
+		return 0
+	}
+	toClean := filepath.Clean(plan.To)
+	changed := 0
+	for cid, mid := range mem {
+		p := byID[mid]
+		if p == nil {
+			continue
+		}
+		ws, _ := p["workspace"].(map[string]any)
+		if ws == nil {
+			continue
+		}
+		onTarget := false
+		if id, _ := ws["id"].(string); id == plan.TargetWSID {
+			onTarget = true
+		}
+		if uri, _ := ws["uri"].(map[string]any); uri != nil && filepath.Clean(mapFsPath(uri)) == toClean {
+			onTarget = true
+		}
+		if !onTarget {
+			continue
+		}
+		h, ok := headers[cid]
+		if ok && composerHeaderBelongsToPlan(h, plan) {
+			continue
+		}
+		home := glassHomeForForeignHeader(h, ok, projects, byID)
+		if home == mid {
+			continue
+		}
+		if home == "" {
+			delete(mem, cid)
+		} else {
+			mem[cid] = home
+		}
+		changed++
+	}
+	return changed
+}
+
+func glassHomeForForeignHeader(
+	h vscdb.ComposerMeta,
+	ok bool,
+	projects *[]map[string]any,
+	byID map[string]map[string]any,
+) string {
+	if !ok || h.WorkspaceIdentifier == nil {
+		return ""
+	}
+	wsID := h.WorkspaceIdentifier.ID
+	fp := uriFsPath(h.WorkspaceIdentifier.URI)
+	for _, p := range *projects {
+		ws, _ := p["workspace"].(map[string]any)
+		if ws == nil {
+			continue
+		}
+		if id, _ := ws["id"].(string); id != "" && id == wsID {
+			if pid, _ := p["id"].(string); pid != "" {
+				return pid
+			}
+		}
+		if uri, _ := ws["uri"].(map[string]any); uri != nil && fp != "" &&
+			filepath.Clean(mapFsPath(uri)) == filepath.Clean(fp) {
+			if pid, _ := p["id"].(string); pid != "" {
+				return pid
+			}
+		}
+	}
+	if wsID == "" || wsID == "empty-window" {
+		return ""
+	}
+	pid := "rebind-" + wsID
+	if len(pid) > 48 {
+		pid = pid[:48]
+	}
+	if _, exists := byID[pid]; exists {
+		return pid
+	}
+	name := filepath.Base(fp)
+	if name == "" || name == "." {
+		name = wsID[:8]
+	}
+	entry := map[string]any{
+		"id":   pid,
+		"name": name,
+		"workspace": map[string]any{
+			"id": wsID,
+		},
+	}
+	if fp != "" {
+		entry["workspace"].(map[string]any)["uri"] = workspaceURIMap(fp)
+	}
+	*projects = append(*projects, entry)
+	byID[pid] = entry
+	return pid
+}
+
+func composersNeedingGlassTo(plan *Plan, headers map[string]vscdb.ComposerMeta) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		if h, ok := headers[id]; ok && !composerHeaderBelongsToPlan(h, plan) {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	for _, id := range plan.SourceInventory.AgentComposerIDs {
+		add(id)
+	}
+	for _, id := range plan.SourceInventory.IDEComposerIDs {
+		add(id)
+	}
+	for _, id := range transcriptComposerIDs(plan) {
+		add(id)
+	}
+	for id, h := range headers {
+		if composerHeaderBelongsToPlan(h, plan) {
+			add(id)
+		}
+	}
+	return out
 }
 
 func transferGlassWorkspaceKeys(db *sql.DB, plan *Plan) (int, error) {
@@ -254,7 +495,14 @@ func glassProjectMatchesFrom(fp, from string, mode Mode) bool {
 	if matches(clean, from, mode) {
 		return true
 	}
-	// Agents Window often keeps the old folder basename even after partial migrates.
-	return filepath.Base(clean) == filepath.Base(from) &&
-		!strings.Contains(clean, ".__rebind_orphan_")
+	if strings.Contains(clean, ".__rebind_orphan_") {
+		return false
+	}
+	base := filepath.Base(from)
+	// Basename-only match helps leftover Agents labels ("mover") but is unsafe for
+	// short names like "ai" (matches too easily / confuses unrelated folders).
+	if !basenameLongEnough(base) {
+		return false
+	}
+	return filepath.Base(clean) == base
 }

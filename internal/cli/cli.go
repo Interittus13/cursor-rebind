@@ -409,6 +409,9 @@ func runMigrate(args []string) error {
 		fmt.Printf(" Agent project dir remapped.")
 	}
 	fmt.Println()
+	if res.TranscriptsWritten > 0 {
+		fmt.Printf("Wrote %d agent-transcripts JSONL file(s) for Agents Window history.\n", res.TranscriptsWritten)
+	}
 	if res.BackupID != "" {
 		fmt.Printf("Backup: %s (cursor-rebind restore %s)\n", res.BackupID, res.BackupID)
 	}
@@ -469,6 +472,9 @@ func runRepair(args []string) error {
 		return err
 	}
 	fmt.Println("Done. Primary IDE tab + Agents Window glass identity repaired.")
+	if res != nil && res.BackupID != "" {
+		fmt.Printf("Backup: %s\n", res.BackupID)
+	}
 	if res != nil && res.PrimaryComposerID != "" {
 		fmt.Printf("Primary composer: %s\n", res.PrimaryComposerID)
 	}
@@ -477,6 +483,9 @@ func runRepair(args []string) error {
 	}
 	if res != nil && (res.GlassProjectsUpdated > 0 || res.GlassKeysMoved > 0) {
 		fmt.Printf("Agents Window: %d project(s), %d glass key(s).\n", res.GlassProjectsUpdated, res.GlassKeysMoved)
+	}
+	if res != nil && res.TranscriptsWritten > 0 {
+		fmt.Printf("Wrote %d agent-transcripts JSONL file(s) for Agents Window history.\n", res.TranscriptsWritten)
 	}
 	fmt.Println("Fully quit Cursor was required; reopen this project path now.")
 	if _, err := os.Stat(f.from); err == nil && !strings.HasSuffix(f.from, ".__rebind_from_unknown") {

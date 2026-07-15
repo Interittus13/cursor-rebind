@@ -149,7 +149,8 @@ func rewriteWorkspaceMetadataEntries(db *sql.DB, plan *Plan) error {
 	sourceSet := toSet(plan.SourceWSIDs)
 	fromClean := filepath.Clean(plan.From)
 	toClean := filepath.Clean(plan.To)
-	display := displayPathFor(plan.To)
+	toDisplay := displayPathFor(plan.To)
+	fromBase := filepath.Base(plan.From)
 	changed := false
 	out := make([]any, 0, len(entries))
 	seenTarget := false
@@ -162,38 +163,45 @@ func rewriteWorkspaceMetadataEntries(db *sql.DB, plan *Plan) error {
 		wid, _ := e["workspaceId"].(string)
 		folderURI, _ := e["folderUri"].(string)
 		fp := paths.PathFromFileURI(folderURI)
-		display, _ := e["displayPath"].(string)
-		fromBase := filepath.Base(plan.From)
-		// Drop any metadata that still advertises --from as a live Agents root,
-		// including stale orphan workspace ids Cursor rehydrates after repair.
-		if sourceSet[wid] || matches(fp, plan.From, plan.Mode) || filepath.Clean(fp) == fromClean ||
-			strings.Contains(display, fromBase) ||
-			strings.HasPrefix(filepath.Clean(fp), fromClean+".__rebind_orphan_") ||
-			strings.Contains(filepath.Clean(fp), ".__rebind_orphan_") && strings.Contains(display, fromBase) {
-			changed = true
-			continue
-		}
-		if wid == plan.TargetWSID || filepath.Clean(fp) == toClean {
+		entryDisplay, _ := e["displayPath"].(string)
+		fpClean := filepath.Clean(fp)
+		// Keep --to first so short basenames ("ai") cannot drop the target via
+		// display-path segment matching.
+		if wid == plan.TargetWSID || fpClean == toClean {
 			seenTarget = true
 			if ensureMetadataTrackedRepo(e, plan.To) {
 				changed = true
 			}
+			out = append(out, e)
+			continue
+		}
+		// Drop metadata that still advertises --from as a live Agents root.
+		if sourceSet[wid] || matches(fp, plan.From, plan.Mode) || fpClean == fromClean ||
+			strings.HasPrefix(fpClean, fromClean+".__rebind_orphan_") {
+			changed = true
+			continue
+		}
+		// Basename segment match only for longer names ("mover"); "ai" matches
+		// both from and to displays and would thrash the target entry.
+		if basenameLongEnough(fromBase) && displayPathHasSegment(entryDisplay, fromBase) {
+			changed = true
+			continue
 		}
 		out = append(out, e)
 	}
 	if !seenTarget && plan.TargetWSID != "" {
 		out = append(out, map[string]any{
 			"workspaceId": plan.TargetWSID,
-			"displayPath": display,
+			"displayPath": toDisplay,
 			"folderUri":   paths.FileURI(plan.To),
 			"paths": []any{
 				map[string]any{
 					"uri":         workspaceURIMap(plan.To),
-					"displayPath": display,
+					"displayPath": toDisplay,
 				},
 			},
 			"trackedGitRepos": []any{
-				map[string]any{"repoPath": toClean},
+				map[string]any{"repoPath": toClean, "branches": []any{}},
 			},
 			"worktreeInfo": map[string]any{"isWorktree": false},
 		})
@@ -204,6 +212,20 @@ func rewriteWorkspaceMetadataEntries(db *sql.DB, plan *Plan) error {
 	}
 	wrap["entries"] = out
 	return vscdb.SetItemJSON(db, "workspaceMetadata.entries", wrap)
+}
+
+// displayPathHasSegment reports whether displayPath contains fromBase as a full
+// path segment (not a substring). "ai" must not match "Arpit".
+func displayPathHasSegment(display, segment string) bool {
+	if display == "" || segment == "" {
+		return false
+	}
+	for _, part := range strings.Split(filepath.ToSlash(display), "/") {
+		if part == segment {
+			return true
+		}
+	}
+	return false
 }
 
 func ensureMetadataTrackedRepo(e map[string]any, abs string) bool {
@@ -220,6 +242,7 @@ func ensureMetadataTrackedRepo(e map[string]any, abs string) bool {
 	}
 	e["trackedGitRepos"] = append(repos, map[string]any{
 		"repoPath": abs,
+		"branches": []any{},
 	})
 	return true
 }
@@ -285,7 +308,38 @@ func scrubGlassSourceKeys(db *sql.DB, plan *Plan) error {
 	// Drop localRepoBranchRecency for --from if present.
 	_ = vscdb.DeleteItem(db, "glass.localRepoBranchRecency."+filepath.Clean(plan.From))
 	_ = vscdb.DeleteItem(db, "glass.localRepoBranchRecency."+filepath.ToSlash(filepath.Clean(plan.From)))
+	_ = scrubGlassSidebarSettings(db, plan)
 	return nil
+}
+
+// scrubGlassSidebarSettings removes --from workspace ids from the Agents
+// sidebar ordering so Cursor cannot keep an "ai" section bound to the old path.
+func scrubGlassSidebarSettings(db *sql.DB, plan *Plan) error {
+	raw, ok, err := vscdb.GetItemRaw(db, "cursor/glassSidebarSettings")
+	if err != nil || !ok {
+		return err
+	}
+	sourceSet := toSet(plan.SourceWSIDs)
+	if len(sourceSet) == 0 || plan.TargetWSID == "" {
+		return nil
+	}
+	replace := map[string]string{}
+	for sid := range sourceSet {
+		if sid == "" || sid == plan.TargetWSID {
+			continue
+		}
+		replace["workspace:"+sid] = "workspace:"+plan.TargetWSID
+		replace[sid] = plan.TargetWSID
+	}
+	before := string(raw)
+	after := before
+	for old, neu := range replace {
+		after = strings.ReplaceAll(after, `"`+old+`"`, `"`+neu+`"`)
+	}
+	if after == before {
+		return nil
+	}
+	return vscdb.SetItemRaw(db, "cursor/glassSidebarSettings", []byte(after))
 }
 
 func retireProjectsSlug(projectsDir string, plan *Plan) error {

@@ -60,10 +60,8 @@ func Analyze(inv *discover.Inventory, query string) (*Report, error) {
 	}
 
 	// IDE sidebar in Cursor 3.0 filters global headers by workspaceIdentifier matching open workspace.
-	currentIDs := map[string]bool{}
 	for _, w := range r.Workspaces {
 		if w.FolderPath == abs || filepath.Clean(w.FolderPath) == abs {
-			currentIDs[w.ID] = true
 			r.IDEVisibleEstimate += w.HeaderChats
 		}
 	}

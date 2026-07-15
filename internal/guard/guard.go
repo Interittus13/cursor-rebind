@@ -77,8 +77,6 @@ func cursorRunningByArgs() (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	self := os.Getpid()
-	_ = self
 	for _, line := range strings.Split(string(out), "\n") {
 		s := strings.TrimSpace(line)
 		if s == "" {
