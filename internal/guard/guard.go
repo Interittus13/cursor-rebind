@@ -39,7 +39,11 @@ func IsCursorRunning() (bool, string, error) {
 		}
 		return false, "", nil
 	default:
-		// Linux / macOS: look for Cursor process names.
+		// Prefer cmdline match: Linux Electron often shows comm=cursor, but some
+		// helpers only appear under /usr/share/cursor/cursor in args.
+		if detail, ok := cursorRunningByArgs(); ok {
+			return true, detail, nil
+		}
 		out, err := exec.Command("ps", "-A", "-o", "comm=").CombinedOutput()
 		if err != nil {
 			// Fallback
@@ -66,4 +70,40 @@ func IsCursorRunning() (bool, string, error) {
 		}
 		return false, "", nil
 	}
+}
+
+func cursorRunningByArgs() (string, bool) {
+	out, err := exec.Command("ps", "-A", "-o", "args=").CombinedOutput()
+	if err != nil {
+		return "", false
+	}
+	self := os.Getpid()
+	_ = self
+	for _, line := range strings.Split(string(out), "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" {
+			continue
+		}
+		lower := strings.ToLower(s)
+		// Ignore our own migration tooling and sandboxed helper wrappers that
+		// are not the IDE main process holding state.vscdb open.
+		if strings.Contains(lower, "cursor-rebind") || strings.Contains(lower, "cursorsandbox") {
+			continue
+		}
+		if strings.Contains(s, "/usr/share/cursor/cursor") ||
+			strings.Contains(s, "/cursor/Cursor") ||
+			strings.Contains(s, "Cursor.app/Contents/MacOS/Cursor") ||
+			strings.HasPrefix(lower, "cursor ") ||
+			lower == "cursor" {
+			// Skip crashpad / chrome-sandbox only helpers.
+			if strings.Contains(lower, "crashpad") || strings.Contains(lower, "chrome-sandbox") {
+				continue
+			}
+			if len(s) > 80 {
+				s = s[:80] + "…"
+			}
+			return s, true
+		}
+	}
+	return "", false
 }

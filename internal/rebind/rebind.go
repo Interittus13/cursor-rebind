@@ -29,21 +29,24 @@ const (
 
 // Plan describes a rebind operation.
 type Plan struct {
-	Mode               Mode     `json:"mode"`
-	From               string   `json:"from"`
-	To                 string   `json:"to"`
-	TargetWSID         string   `json:"targetWorkspaceId,omitempty"`
-	SourceWSIDs        []string `json:"sourceWorkspaceIds,omitempty"`
-	HeadersByPath      int      `json:"headersByPath"`
-	HeadersByWorkspace int      `json:"headersByWorkspaceId"`
-	HeadersMatched     int      `json:"headersMatched"`
-	ComposersFromWS    int      `json:"composersFromWorkspaceDb"`
-	ProjectFrom        string   `json:"projectFrom,omitempty"`
-	ProjectTo          string   `json:"projectTo,omitempty"`
-	ProjectExists      bool     `json:"projectFromExists"`
-	TargetExists       bool     `json:"targetPathExists"`
-	Warnings           []string `json:"warnings,omitempty"`
-	Ops                []Op     `json:"ops"`
+	Mode               Mode          `json:"mode"`
+	From               string        `json:"from"`
+	To                 string        `json:"to"`
+	Strategy           Strategy      `json:"strategy,omitempty"`
+	TargetWSID         string        `json:"targetWorkspaceId,omitempty"`
+	SourceWSIDs        []string      `json:"sourceWorkspaceIds,omitempty"`
+	SourceInventory    SideInventory `json:"sourceInventory"`
+	TargetInventory    SideInventory `json:"targetInventory"`
+	HeadersByPath      int           `json:"headersByPath"`
+	HeadersByWorkspace int           `json:"headersByWorkspaceId"`
+	HeadersMatched     int           `json:"headersMatched"`
+	ComposersFromWS    int           `json:"composersFromWorkspaceDb"`
+	ProjectFrom        string        `json:"projectFrom,omitempty"`
+	ProjectTo          string        `json:"projectTo,omitempty"`
+	ProjectExists      bool          `json:"projectFromExists"`
+	TargetExists       bool          `json:"targetPathExists"`
+	Warnings           []string      `json:"warnings,omitempty"`
+	Ops                []Op          `json:"ops"`
 }
 
 // Op is one planned mutation.
@@ -55,12 +58,14 @@ type Op struct {
 
 // Result is the outcome of Apply.
 type Result struct {
-	BackupID         string `json:"backupId"`
-	HeadersUpdated   int    `json:"headersUpdated"`
-	HeadersAdded     int    `json:"headersAdded"`
-	ProjectMoved     bool   `json:"projectMoved"`
-	TargetWSID       string `json:"targetWorkspaceId"`
-	WorkspaceJSONSkip bool  `json:"workspaceJsonSkipped"`
+	BackupID             string `json:"backupId"`
+	HeadersUpdated       int    `json:"headersUpdated"`
+	HeadersAdded         int    `json:"headersAdded"`
+	ComposersRewritten   int    `json:"composersRewritten"`
+	GlassProjectsUpdated int    `json:"glassProjectsUpdated"`
+	GlassKeysMoved       int    `json:"glassKeysMoved"`
+	ProjectMoved         bool   `json:"projectMoved"`
+	TargetWSID           string `json:"targetWorkspaceId"`
 }
 
 // BuildPlan constructs a rebind plan from inventory + from/to.
@@ -102,6 +107,19 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 	if len(p.SourceWSIDs) == 0 && mode == ModeExact {
 		p.Warnings = append(p.Warnings, "no source workspaceStorage id found for --from (path may already have been rewritten)")
 	}
+
+	gdb := openGlobalRO(inv)
+	if gdb != nil {
+		defer gdb.Close()
+	}
+	p.SourceInventory = inventoryPath(inv, gdb, from, p.SourceWSIDs)
+	targetIDs := []string{}
+	if p.TargetWSID != "" {
+		targetIDs = []string{p.TargetWSID}
+	}
+	p.TargetInventory = inventoryPath(inv, gdb, to, targetIDs)
+	p.Strategy = chooseStrategy(p.TargetWSID, p.TargetInventory)
+	p.Warnings = append(p.Warnings, "strategy: "+strategyDetail(p.Strategy, p.SourceInventory, p.TargetInventory))
 
 	sourceSet := toSet(p.SourceWSIDs)
 	byPath, byWS := 0, 0
@@ -191,8 +209,18 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 
 	totalTouch := p.HeadersMatched + missing
 	p.Ops = append(p.Ops, Op{
+		Kind:   "strategy",
+		Detail: strategyDetail(p.Strategy, p.SourceInventory, p.TargetInventory),
+	})
+	if p.Strategy == StrategyCreate {
+		p.Ops = append(p.Ops, Op{
+			Kind:   "create-workspace",
+			Detail: "create workspaceStorage entry for --to before moving chats",
+		})
+	}
+	p.Ops = append(p.Ops, Op{
 		Kind:   "rewrite-headers",
-		Detail: fmt.Sprintf("retag/register composer.composerHeaders for %s → %s", from, to),
+		Detail: fmt.Sprintf("IDE: retag/register composer.composerHeaders for %s → %s", from, to),
 		Count:  totalTouch,
 	})
 
@@ -213,13 +241,26 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 				})
 			}
 		}
-		p.Ops = append(p.Ops, Op{
-			Kind:   "transfer-workspace-tabs",
-			Detail: "bind one primary contentful composer + copy Cursor editor restore state onto the target",
-		})
+		switch p.Strategy {
+		case StrategyMerge:
+			p.Ops = append(p.Ops, Op{
+				Kind:   "transfer-workspace-tabs",
+				Detail: "IDE: merge — keep target contentful chats, attach source chats, bind richest primary",
+			})
+		case StrategyReplaceEmpty:
+			p.Ops = append(p.Ops, Op{
+				Kind:   "transfer-workspace-tabs",
+				Detail: "IDE: replace empty target stubs with source contentful primary chat",
+			})
+		default:
+			p.Ops = append(p.Ops, Op{
+				Kind:   "transfer-workspace-tabs",
+				Detail: "IDE: bind primary contentful composer + editor restore state onto the new workspace",
+			})
+		}
 		p.Ops = append(p.Ops, Op{
 			Kind:   "rewrite-glass-projects",
-			Detail: "retag Agents Window glass.localAgentProjects from --from → --to",
+			Detail: "Agents Window: retag glass projects + move glass.tabs / cache keys (same pass as IDE)",
 		})
 		p.Ops = append(p.Ops, Op{
 			Kind:   "detach-orphan-workspaces",
@@ -433,6 +474,13 @@ func readWorkspaceComposerIDs(dbPath string) []string {
 		}
 	}
 
+	// Editor restore often still references the real chat after selectedComposerIds
+	// has been overwritten with an empty stub (classic Ctrl+Alt+J failure mode).
+	if raw, ok, _ := vscdb.GetItemRaw(db, "workbench.parts.embeddedAuxBarEditor.state"); ok {
+		extractComposerIDsFromJSON(raw, add)
+		extractComposerIDsFromEditorValue(raw, add)
+	}
+
 	// Pane / view state often retains composer ids not yet in global headers.
 	rows, err := db.Query(`SELECT key, value FROM ItemTable WHERE key LIKE 'workbench.panel.composerChatViewPane%'`)
 	if err == nil {
@@ -447,6 +495,54 @@ func readWorkspaceComposerIDs(dbPath string) []string {
 		}
 	}
 	return out
+}
+
+// extractComposerIDsFromEditorValue digs into nested JSON-string editor payloads.
+func extractComposerIDsFromEditorValue(raw []byte, add func(string)) {
+	var state map[string]any
+	if json.Unmarshal(raw, &state) != nil {
+		return
+	}
+	grid, _ := state["serializedGrid"].(map[string]any)
+	if grid == nil {
+		return
+	}
+	root, _ := grid["root"].(map[string]any)
+	if root == nil {
+		return
+	}
+	var walkLeaves func(any)
+	walkLeaves = func(n any) {
+		m, ok := n.(map[string]any)
+		if !ok {
+			return
+		}
+		if typ, _ := m["type"].(string); typ == "leaf" {
+			inner, _ := m["data"].(map[string]any)
+			editors, _ := inner["editors"].([]any)
+			for _, ed := range editors {
+				em, _ := ed.(map[string]any)
+				val, _ := em["value"].(string)
+				if val == "" {
+					continue
+				}
+				var payload map[string]any
+				if json.Unmarshal([]byte(val), &payload) != nil {
+					continue
+				}
+				if id, _ := payload["composerId"].(string); looksLikeUUID(id) {
+					add(id)
+				}
+			}
+			return
+		}
+		if data, ok := m["data"].([]any); ok {
+			for _, child := range data {
+				walkLeaves(child)
+			}
+		}
+	}
+	walkLeaves(root)
 }
 
 func extractComposerIDsFromJSON(raw []byte, add func(string)) {
@@ -545,12 +641,19 @@ func FormatPlan(p *Plan) string {
 	fmt.Fprintf(&b, "Mode:     %s\n", p.Mode)
 	fmt.Fprintf(&b, "From:     %s\n", p.From)
 	fmt.Fprintf(&b, "To:       %s\n", p.To)
+	if p.Strategy != "" {
+		fmt.Fprintf(&b, "Strategy: %s\n", p.Strategy)
+	}
 	if p.TargetWSID != "" {
 		fmt.Fprintf(&b, "Target ID:%s\n", p.TargetWSID)
 	}
 	if len(p.SourceWSIDs) > 0 {
 		fmt.Fprintf(&b, "Source IDs:%s\n", strings.Join(p.SourceWSIDs, ", "))
 	}
+	fmt.Fprintf(&b, "Source chats: IDE=%d contentful (%d empty), Agent=%d\n",
+		p.SourceInventory.IDEContentful, p.SourceInventory.IDEEmpty, len(p.SourceInventory.AgentComposerIDs))
+	fmt.Fprintf(&b, "Target chats: IDE=%d contentful (%d empty), Agent=%d\n",
+		p.TargetInventory.IDEContentful, p.TargetInventory.IDEEmpty, len(p.TargetInventory.AgentComposerIDs))
 	fmt.Fprintf(&b, "Headers:  %d matched (path=%d, workspaceId=%d)\n", p.HeadersMatched, p.HeadersByPath, p.HeadersByWorkspace)
 	fmt.Fprintf(&b, "WS composers: %d\n", p.ComposersFromWS)
 	fmt.Fprintf(&b, "Target exists on disk: %v\n\n", p.TargetExists)
@@ -574,7 +677,9 @@ func FormatPlan(p *Plan) string {
 
 // Apply executes the plan. dryRun skips mutations.
 func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, error) {
-	touchable := plan.HeadersMatched > 0 || plan.ComposersFromWS > 0 || plan.ProjectExists || len(plan.SourceWSIDs) > 0
+	touchable := plan.HeadersMatched > 0 || plan.ComposersFromWS > 0 || plan.ProjectExists ||
+		len(plan.SourceWSIDs) > 0 || plan.SourceInventory.HasContentful() ||
+		plan.Strategy == StrategyCreate
 	if !touchable {
 		return nil, fmt.Errorf("nothing to rebind — no matching headers, workspace ids, or agent project dirs")
 	}
@@ -599,6 +704,9 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 		}
 		plan.TargetWSID = id
 		res.TargetWSID = id
+		if plan.Strategy == "" {
+			plan.Strategy = StrategyCreate
+		}
 	}
 
 	id, bdir, man, err := backup.Create(fmt.Sprintf("rebind %s → %s (%s)", plan.From, plan.To, plan.Mode))
@@ -637,15 +745,26 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 			return nil, fmt.Errorf("workspace.json: %w", err)
 		}
 	} else {
-		res.WorkspaceJSONSkip = true
-		if err := transferWorkspaceTabs(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan); err != nil {
+		n, err := rewriteComposerDiskPaths(inv.Roots.GlobalDB, plan)
+		if err != nil {
+			return nil, fmt.Errorf("composer disk paths: %w", err)
+		}
+		res.ComposersRewritten = n
+		primary, err := transferWorkspaceTabsPrimary(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan)
+		if err != nil {
 			return nil, fmt.Errorf("transfer tabs: %w", err)
 		}
-		if err := rewriteGlassAgentProjects(inv.Roots.GlobalDB, plan); err != nil {
-			return nil, fmt.Errorf("glass agent projects: %w", err)
+		gp, gk, err := rewriteGlassAgentIdentity(inv.Roots.GlobalDB, plan, primary)
+		if err != nil {
+			return nil, fmt.Errorf("glass agent identity: %w", err)
 		}
+		res.GlassProjectsUpdated = gp
+		res.GlassKeysMoved = gk
 		if err := detachOrphanWorkspaces(inv.Roots.WorkspaceStorage, plan); err != nil {
 			return nil, fmt.Errorf("detach orphans: %w", err)
+		}
+		if err := retireSourceIdentity(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, inv.Roots.ProjectsDir, plan); err != nil {
+			return nil, fmt.Errorf("retire source identity: %w", err)
 		}
 	}
 
@@ -655,6 +774,12 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 	}
 	res.ProjectMoved = moved
 
+	// Cursor ItemTable must be SQLITE TEXT. Our older builds wrote BLOBs, and
+	// Electron then JSON.parses Uint8Arrays as "123,34,…" (crash at position 3).
+	if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
+		return nil, fmt.Errorf("normalize storage text: %w", err)
+	}
+
 	return res, nil
 }
 
@@ -663,7 +788,10 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 	if err != nil {
 		return 0, 0, err
 	}
-	defer db.Close()
+	defer func() {
+		_ = vscdb.CheckpointWAL(db)
+		_ = db.Close()
+	}()
 
 	var headers vscdb.ComposerHeaders
 	ok, err := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers)
@@ -689,10 +817,7 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 				hit = true
 			}
 			if c.WorkspaceIdentifier.URI != nil {
-				fp := c.WorkspaceIdentifier.URI.FsPath
-				if fp == "" {
-					fp = c.WorkspaceIdentifier.URI.Path
-				}
+				fp := uriFsPath(c.WorkspaceIdentifier.URI)
 				if fp != "" && matches(fp, plan.From, plan.Mode) {
 					hit = true
 				}
@@ -716,13 +841,7 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 			c.WorkspaceIdentifier.ID = plan.TargetWSID
 			c.WorkspaceIdentifier.URI = targetURI
 		} else {
-			fp := ""
-			if c.WorkspaceIdentifier.URI != nil {
-				fp = c.WorkspaceIdentifier.URI.FsPath
-				if fp == "" {
-					fp = c.WorkspaceIdentifier.URI.Path
-				}
-			}
+			fp := uriFsPath(c.WorkspaceIdentifier.URI)
 			newPath := rewritePath(fp, plan.From, plan.To, plan.Mode)
 			if newPath == "" {
 				newPath = plan.To
@@ -753,7 +872,7 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 					c.WorkspaceIdentifier.URI = targetURI
 					updated++
 				} else if c.WorkspaceIdentifier.URI == nil ||
-					filepath.Clean(c.WorkspaceIdentifier.URI.FsPath) != filepath.Clean(plan.To) {
+					filepath.Clean(uriFsPath(c.WorkspaceIdentifier.URI)) != filepath.Clean(plan.To) {
 					c.WorkspaceIdentifier.URI = targetURI
 					updated++
 				}
@@ -895,15 +1014,17 @@ func loadComposerMeta(db *sql.DB, composerID string) vscdb.ComposerMeta {
 	return meta
 }
 
-func transferWorkspaceTabs(wsRoot, globalDBPath string, plan *Plan) error {
+// transferWorkspaceTabsPrimary binds one contentful composer into the target workspace
+// and returns the primary composer id (empty if nothing contentful was found).
+func transferWorkspaceTabsPrimary(wsRoot, globalDBPath string, plan *Plan) (string, error) {
 	if plan.TargetWSID == "" {
-		return nil
+		return "", nil
 	}
 	targetDB := filepath.Join(wsRoot, plan.TargetWSID, "state.vscdb")
 
 	globalDB, gerr := vscdb.OpenReadOnly(globalDBPath)
 	if gerr != nil {
-		return fmt.Errorf("open global db for emptiness checks: %w", gerr)
+		return "", fmt.Errorf("open global db for emptiness checks: %w", gerr)
 	}
 
 	var contentful []string
@@ -932,6 +1053,8 @@ func transferWorkspaceTabs(wsRoot, globalDBPath string, plan *Plan) error {
 	for _, id := range transcriptComposerIDs(plan) {
 		consider(id)
 	}
+	// Editor restore on the target often still points at the real chat after
+	// selectedComposerIds was replaced with an empty stub.
 	for _, id := range readWorkspaceComposerIDs(targetDB) {
 		consider(id)
 	}
@@ -953,11 +1076,26 @@ func transferWorkspaceTabs(wsRoot, globalDBPath string, plan *Plan) error {
 	// Bind at most one primary conversation into the open editor. History/sidebar
 	// still lists everything via composer.composerHeaders.
 	if len(contentful) > 1 {
-		primary := contentful[0]
-		for _, id := range sourceSelected {
-			if !composerIsEmpty(globalDB, id, "") {
-				primary = id
-				break
+		primary := contentful[0] // richest after sort
+		switch plan.Strategy {
+		case StrategyReplaceEmpty, StrategyCreate:
+			// Prefer a composer that was open on the source workspace.
+			for _, id := range sourceSelected {
+				if !composerIsEmpty(globalDB, id, "") {
+					primary = id
+					break
+				}
+			}
+		case StrategyMerge:
+			// Prefer richest overall; if target already focused a contentful chat, keep it.
+			for _, id := range readWorkspaceComposerIDs(targetDB) {
+				if !composerIsEmpty(globalDB, id, "") {
+					// Keep target focus only when it is among the richest (top bubble count).
+					if composerBubbleCount(globalDB, id) >= composerBubbleCount(globalDB, primary) {
+						primary = id
+					}
+					break
+				}
 			}
 		}
 		contentful = []string{primary}
@@ -966,32 +1104,36 @@ func transferWorkspaceTabs(wsRoot, globalDBPath string, plan *Plan) error {
 
 	// Never wipe a working tab state with an empty selection (re-migrate after orphan).
 	if len(contentful) == 0 {
-		return nil
+		return "", nil
 	}
 
 	if _, err := os.Stat(targetDB); err != nil {
 		if err := os.MkdirAll(filepath.Dir(targetDB), 0o755); err != nil {
-			return err
+			return "", err
 		}
 		f, cerr := os.Create(targetDB)
 		if cerr != nil {
-			return cerr
+			return "", cerr
 		}
 		_ = f.Close()
 		db, err := vscdb.OpenReadWrite(targetDB)
 		if err != nil {
-			return err
+			return "", err
 		}
 		_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE, value BLOB)`)
 		_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT UNIQUE, value BLOB)`)
+		_ = vscdb.CheckpointWAL(db)
 		_ = db.Close()
 	}
 
 	db, err := vscdb.OpenReadWrite(targetDB)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer db.Close()
+	defer func() {
+		_ = vscdb.CheckpointWAL(db)
+		_ = db.Close()
+	}()
 
 	var data vscdb.ComposerData
 	_, _ = vscdb.GetItemJSON(db, "composer.composerData", &data)
@@ -999,8 +1141,16 @@ func transferWorkspaceTabs(wsRoot, globalDBPath string, plan *Plan) error {
 	data.LastFocusedComposerIDs = []string{contentful[0]}
 	data.HasMigratedComposerData = true
 	data.HasMigratedMultipleComposers = true
+	// Drop leftover empty stubs from allComposers so Cursor doesn't reopen them.
+	var kept []vscdb.ComposerMeta
+	for _, c := range data.AllComposers {
+		if c.ComposerID == contentful[0] {
+			kept = append(kept, c)
+		}
+	}
+	data.AllComposers = kept
 	if err := vscdb.SetItemJSON(db, "composer.composerData", data); err != nil {
-		return err
+		return "", err
 	}
 
 	// Prefer copying Cursor's own editor serialization from a source (or orphan).
@@ -1009,32 +1159,26 @@ func transferWorkspaceTabs(wsRoot, globalDBPath string, plan *Plan) error {
 	if raw := findSourceEditorState(wsRoot, editorIDs); len(raw) > 0 {
 		patched := rewriteEditorStateComposerIDs(raw, contentful[0])
 		if err := vscdb.SetItemRaw(db, "workbench.parts.embeddedAuxBarEditor.state", patched); err != nil {
-			return err
+			return "", err
 		}
 	} else if err := vscdb.SetItemJSON(db, "workbench.parts.embeddedAuxBarEditor.state", buildComposerEditorState(contentful)); err != nil {
-		return err
+		return "", err
 	}
 	if err := vscdb.SetItemRaw(db, "workbench.parts.embeddedAuxBarEditor.lastActivePart", []byte("embedded")); err != nil {
-		return err
+		return "", err
 	}
 	_ = vscdb.SetItemRaw(db, "cursor/needsComposerInitialOpening", []byte("false"))
 
 	if bg := readBestBackgroundComposer(wsRoot, plan); bg != nil {
 		if remote, ok := bg["cachedSelectedRemote"].(map[string]any); ok {
-			remote["rootUri"] = map[string]any{
-				"$mid":     1,
-				"fsPath":   filepath.Clean(plan.To),
-				"external": paths.FileURI(plan.To),
-				"path":     filepath.ToSlash(filepath.Clean(plan.To)),
-				"scheme":   "file",
-			}
+			remote["rootUri"] = workspaceURIMap(plan.To)
 			bg["cachedSelectedRemote"] = remote
 		}
 		_ = vscdb.SetItemJSON(db, "workbench.backgroundComposer.workspacePersistentData", bg)
 	}
 
 	_ = clearComposerStuckFlags(globalDBPath, contentful[0])
-	return nil
+	return contentful[0], nil
 }
 
 func headerComposerIDsForPlan(db *sql.DB, plan *Plan) []string {
@@ -1051,10 +1195,7 @@ func headerComposerIDsForPlan(db *sql.DB, plan *Plan) []string {
 		}
 		hit := sourceSet[c.WorkspaceIdentifier.ID] || c.WorkspaceIdentifier.ID == plan.TargetWSID
 		if c.WorkspaceIdentifier.URI != nil {
-			fp := c.WorkspaceIdentifier.URI.FsPath
-			if fp == "" {
-				fp = c.WorkspaceIdentifier.URI.Path
-			}
+			fp := uriFsPath(c.WorkspaceIdentifier.URI)
 			if fp != "" {
 				clean := filepath.Clean(fp)
 				if matches(clean, plan.From, plan.Mode) || clean == filepath.Clean(plan.To) {
@@ -1140,7 +1281,10 @@ func clearComposerStuckFlags(globalDBPath, composerID string) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer func() {
+		_ = vscdb.CheckpointWAL(db)
+		_ = db.Close()
+	}()
 	raw, ok, err := vscdb.GetDiskKVRaw(db, "composerData:"+composerID)
 	if err != nil || !ok {
 		return err
@@ -1149,16 +1293,7 @@ func clearComposerStuckFlags(globalDBPath, composerID string) error {
 	if json.Unmarshal(raw, &blob) != nil {
 		return nil
 	}
-	changed := false
-	if st, _ := blob["status"].(string); st == "aborted" || st == "generating" || st == "error" {
-		blob["status"] = "none"
-		changed = true
-	}
-	if _, ok := blob["generatingBubbleIds"]; ok {
-		blob["generatingBubbleIds"] = []any{}
-		changed = true
-	}
-	if !changed {
+	if !clearStuckFlagsInBlob(blob) {
 		return nil
 	}
 	out, err := json.Marshal(blob)
@@ -1166,7 +1301,7 @@ func clearComposerStuckFlags(globalDBPath, composerID string) error {
 		return err
 	}
 	_, err = db.Exec(`INSERT INTO cursorDiskKV(key, value) VALUES(?, ?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, "composerData:"+composerID, out)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, "composerData:"+composerID, string(out))
 	return err
 }
 
@@ -1237,156 +1372,7 @@ func detachOrphanWorkspaces(wsRoot string, plan *Plan) error {
 	if plan.Mode != ModeExact || plan.TargetWSID == "" {
 		return nil
 	}
-	to := filepath.Clean(plan.To)
-	entries, err := os.ReadDir(wsRoot)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if !e.IsDir() || e.Name() == plan.TargetWSID {
-			continue
-		}
-		metaPath := filepath.Join(wsRoot, e.Name(), "workspace.json")
-		raw, err := os.ReadFile(metaPath)
-		if err != nil {
-			continue
-		}
-		var meta map[string]any
-		if json.Unmarshal(raw, &meta) != nil {
-			continue
-		}
-		folder, _ := meta["folder"].(string)
-		if filepath.Clean(paths.PathFromFileURI(folder)) != to {
-			continue
-		}
-		// Point the duplicate at a non-existent path so Cursor won't open it for `to`.
-		orphan := to + ".__rebind_orphan_" + e.Name()[:8]
-		meta["folder"] = paths.FileURI(orphan)
-		out, err := json.MarshalIndent(meta, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(metaPath, out, 0o644); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// rewriteGlassAgentProjects retags the Agents Window index (separate from IDE headers).
-func rewriteGlassAgentProjects(globalDB string, plan *Plan) error {
-	db, err := vscdb.OpenReadWrite(globalDB)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	raw, ok, err := vscdb.GetItemRaw(db, "glass.localAgentProjects.v1")
-	if err != nil || !ok {
-		return err
-	}
-	var projects []map[string]any
-	if json.Unmarshal(raw, &projects) != nil {
-		return nil
-	}
-
-	memberHit := map[string]bool{}
-	if mraw, mok, _ := vscdb.GetItemRaw(db, "glass.localAgentProjectMembership.v1"); mok {
-		var mem map[string]string
-		if json.Unmarshal(mraw, &mem) == nil {
-			for _, cid := range transcriptComposerIDs(plan) {
-				if pid := mem[cid]; pid != "" {
-					memberHit[pid] = true
-				}
-			}
-			var headers vscdb.ComposerHeaders
-			if ok, _ := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers); ok {
-				sourceSet := toSet(plan.SourceWSIDs)
-				for _, c := range headers.AllComposers {
-					hit := false
-					if c.WorkspaceIdentifier != nil {
-						if sourceSet[c.WorkspaceIdentifier.ID] || c.WorkspaceIdentifier.ID == plan.TargetWSID {
-							hit = true
-						}
-						if c.WorkspaceIdentifier.URI != nil {
-							fp := c.WorkspaceIdentifier.URI.FsPath
-							if fp == "" {
-								fp = c.WorkspaceIdentifier.URI.Path
-							}
-							if fp != "" && (matches(fp, plan.From, plan.Mode) || filepath.Clean(fp) == filepath.Clean(plan.To)) {
-								hit = true
-							}
-						}
-					}
-					if hit {
-						if pid := mem[c.ComposerID]; pid != "" {
-							memberHit[pid] = true
-						}
-					}
-				}
-			}
-		}
-	}
-
-	sourceSet := toSet(plan.SourceWSIDs)
-	targetURI := map[string]any{
-		"$mid":     1,
-		"fsPath":   filepath.Clean(plan.To),
-		"external": paths.FileURI(plan.To),
-		"path":     filepath.ToSlash(filepath.Clean(plan.To)),
-		"scheme":   "file",
-	}
-	changed := 0
-	for _, p := range projects {
-		ws, _ := p["workspace"].(map[string]any)
-		if ws == nil {
-			continue
-		}
-		hit := false
-		if id, _ := p["id"].(string); id != "" && memberHit[id] {
-			hit = true
-		}
-		if id, _ := ws["id"].(string); id != "" && (sourceSet[id] || id == plan.TargetWSID) {
-			hit = true
-		}
-		uri, _ := ws["uri"].(map[string]any)
-		if uri != nil {
-			fp, _ := uri["fsPath"].(string)
-			if fp == "" {
-				fp, _ = uri["path"].(string)
-			}
-			if fp != "" {
-				clean := filepath.Clean(fp)
-				if matches(clean, plan.From, plan.Mode) || (plan.Mode == ModeExact && clean == filepath.Clean(plan.To)) {
-					hit = true
-				}
-				if strings.Contains(clean, ".__rebind_orphan_") {
-					hit = true
-				}
-			}
-		}
-		if !hit {
-			continue
-		}
-		ws["id"] = plan.TargetWSID
-		ws["uri"] = targetURI
-		p["workspace"] = ws
-		changed++
-	}
-	if changed == 0 {
-		return nil
-	}
-	return vscdb.SetItemJSON(db, "glass.localAgentProjects.v1", projects)
-}
-
-func buildURI(absPath string) *vscdb.WorkspaceURI {
-	clean := filepath.ToSlash(filepath.Clean(absPath))
-	return &vscdb.WorkspaceURI{
-		Scheme:   "file",
-		Path:     clean,
-		FsPath:   filepath.Clean(absPath),
-		External: paths.FileURI(absPath),
-	}
+	return orphanWorkspaceFolders(wsRoot, plan.To, plan.TargetWSID)
 }
 
 func rewriteWorkspaceJSON(wsRoot string, plan *Plan) error {
@@ -1567,29 +1553,88 @@ func randomID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
+// RepairResult is the outcome of RepairTabs.
+type RepairResult struct {
+	PrimaryComposerID    string
+	ComposersRewritten   int
+	GlassProjectsUpdated int
+	GlassKeysMoved       int
+}
+
 // RepairTabs rebinds the IDE open-tab / Agents Window identity for an already-migrated
 // target without rewriting headers again. Cursor must be fully quit.
-func RepairTabs(inv *discover.Inventory, plan *Plan, yes bool) error {
+func RepairTabs(inv *discover.Inventory, plan *Plan, yes bool) (*RepairResult, error) {
 	if plan == nil {
-		return fmt.Errorf("nil plan")
+		return nil, fmt.Errorf("nil plan")
 	}
 	if plan.Mode != ModeExact {
-		return fmt.Errorf("repair only supports exact mode")
+		return nil, fmt.Errorf("repair only supports exact mode")
 	}
 	if plan.TargetWSID == "" {
-		return fmt.Errorf("no target workspace id — pass --target-id or open the project once in Cursor")
+		return nil, fmt.Errorf("no target workspace id — pass --target-id or open the project once in Cursor")
 	}
 	if !yes {
-		return fmt.Errorf("refusing to write without --yes")
+		return nil, fmt.Errorf("refusing to write without --yes")
 	}
 	if err := guard.EnsureCursorClosed(); err != nil {
-		return err
+		return nil, err
 	}
-	if err := transferWorkspaceTabs(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan); err != nil {
-		return fmt.Errorf("repair tabs: %w", err)
+	n, err := rewriteComposerDiskPaths(inv.Roots.GlobalDB, plan)
+	if err != nil {
+		return nil, fmt.Errorf("repair composer disk paths: %w", err)
 	}
-	if err := rewriteGlassAgentProjects(inv.Roots.GlobalDB, plan); err != nil {
-		return fmt.Errorf("repair glass: %w", err)
+	primary, err := transferWorkspaceTabsPrimary(inv.Roots.WorkspaceStorage, inv.Roots.GlobalDB, plan)
+	if err != nil {
+		return nil, fmt.Errorf("repair tabs: %w", err)
+	}
+	gp, gk, err := rewriteGlassAgentIdentity(inv.Roots.GlobalDB, plan, primary)
+	if err != nil {
+		return nil, fmt.Errorf("repair glass: %w", err)
+	}
+	if err := detachOrphanWorkspaces(inv.Roots.WorkspaceStorage, plan); err != nil {
+		return nil, fmt.Errorf("repair detach orphans: %w", err)
+	}
+	if err := retireSourceIdentity(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, inv.Roots.ProjectsDir, plan); err != nil {
+		return nil, fmt.Errorf("repair retire source: %w", err)
+	}
+	if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
+		return nil, fmt.Errorf("repair normalize: %w", err)
+	}
+	return &RepairResult{
+		PrimaryComposerID:    primary,
+		ComposersRewritten:   n,
+		GlassProjectsUpdated: gp,
+		GlassKeysMoved:       gk,
+	}, nil
+}
+
+func normalizeStorageText(globalDB, wsRoot string, plan *Plan) error {
+	paths := []string{globalDB}
+	if plan != nil && plan.TargetWSID != "" {
+		paths = append(paths, filepath.Join(wsRoot, plan.TargetWSID, "state.vscdb"))
+	}
+	if plan != nil {
+		for _, sid := range plan.SourceWSIDs {
+			if sid == "" || (plan.TargetWSID != "" && sid == plan.TargetWSID) {
+				continue
+			}
+			paths = append(paths, filepath.Join(wsRoot, sid, "state.vscdb"))
+		}
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		db, err := vscdb.OpenReadWrite(p)
+		if err != nil {
+			return err
+		}
+		if _, err := vscdb.NormalizeItemTableText(db); err != nil {
+			_ = db.Close()
+			return err
+		}
+		_ = vscdb.CheckpointWAL(db)
+		_ = db.Close()
 	}
 	return nil
 }

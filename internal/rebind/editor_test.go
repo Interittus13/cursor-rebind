@@ -2,6 +2,9 @@ package rebind
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Interittus13/cursor-rebind/internal/discover"
@@ -49,5 +52,27 @@ func TestFindSourceIncludesOrphans(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected orphan in sources, got %v", sources)
+	}
+}
+
+func TestDisplayPathFor(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip(err)
+	}
+	got := displayPathFor(filepath.Join(home, "Documents", "proj"))
+	if !strings.HasPrefix(got, "~/") {
+		t.Fatalf("displayPath=%q", got)
+	}
+}
+
+func TestExtractComposerIDsFromEditorValue(t *testing.T) {
+	raw := []byte(`{"serializedGrid":{"root":{"type":"branch","data":[{"type":"leaf","data":{"id":1,"editors":[{"id":"workbench.editor.composer.input","value":"{\"composerId\":\"df8087ae-c788-4a3e-82f9-33a9ef6ab8b7\",\"restoreInRegularEditorGroup\":true}"}],"mru":[0]},"size":679}],"size":444},"orientation":0},"activeGroup":1}`)
+	var got []string
+	extractComposerIDsFromEditorValue(raw, func(id string) {
+		got = append(got, id)
+	})
+	if len(got) != 1 || got[0] != "df8087ae-c788-4a3e-82f9-33a9ef6ab8b7" {
+		t.Fatalf("got %v", got)
 	}
 }

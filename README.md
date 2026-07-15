@@ -51,14 +51,14 @@ cursor-rebind doctor /path/to/project
 # Preview a rebind
 cursor-rebind map --from /old/path --to /new/path
 
-# Machine move (rewrite a path prefix)
+# Machine move (path-prefix rewrite only; Agents Window may still need exact migrate/repair)
 cursor-rebind map --from /home/olduser --to /home/newuser --prefix
 
 # Apply (quit Cursor fully first)
 cursor-rebind migrate --from /old/path --to /new/path --yes
 
-# If open tabs are empty / stuck after migrate, repair them (quit Cursor first)
-cursor-rebind repair --from /old/path --to /new/path --target-id <workspace-id> --yes
+# Repair Agents/IDE identity after a partial migrate (quit Cursor first)
+cursor-rebind repair --to /new/path --from /old/path --target-id <workspace-id> --yes
 
 cursor-rebind verify /new/path
 cursor-rebind restore --list
@@ -66,8 +66,13 @@ cursor-rebind restore --list
 
 **Notes**
 - Quit Cursor completely before `migrate` / `repair` (reload is not enough).
-- `migrate` retags chat headers, binds one primary conversation into the IDE tab strip, updates Agents Window project labels, and detaches duplicate workspace folders.
-- Prefer `--target-id` when multiple `workspaceStorage` entries exist for the same folder (common after a rename).
+- Prefer `--target-id` when multiple `workspaceStorage` entries exist for the same folder.
+- After a folder rename, delete or rename any leftover empty `--from` directory, then reopen only `--to`.
+- `migrate` strategy (`create` / `replace-empty` / `merge`) chooses plan messaging and which chat becomes the primary tab. Apply steps are the same; **merge does not combine two threads into one**.
+- Exact-mode migrate/repair updates both surfaces:
+  - IDE: `composer.composerHeaders` + open tabs/editor
+  - Agents: `composerData.workspaceIdentifier` + `trackedGitRepos.repoUrl`, glass projects/tabs, and retired `--from` metadata
+- `Updated 0 header(s)` is OK when headers already point at `--to`.
 
 ## How it works
 

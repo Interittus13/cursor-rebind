@@ -60,7 +60,6 @@ Usage:
   cursor-rebind scan [--json]
   cursor-rebind doctor [path] [--json]
   cursor-rebind map --from <old> --to <new> [--prefix] [--json]
-  cursor-rebind preview --from <old> --to <new> [--prefix]
   cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--dry-run|--yes]
   cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] --yes
   cursor-rebind verify [path]
@@ -397,6 +396,15 @@ func runMigrate(args []string) error {
 		fmt.Printf(", added %d", res.HeadersAdded)
 	}
 	fmt.Printf(".")
+	if res.HeadersUpdated == 0 && res.HeadersAdded == 0 {
+		fmt.Printf(" (headers already on --to)")
+	}
+	if res.ComposersRewritten > 0 {
+		fmt.Printf(" Rewrote %d composerData blob(s).", res.ComposersRewritten)
+	}
+	if res.GlassProjectsUpdated > 0 || res.GlassKeysMoved > 0 {
+		fmt.Printf(" Agents Window: %d project(s), %d glass key(s).", res.GlassProjectsUpdated, res.GlassKeysMoved)
+	}
 	if res.ProjectMoved {
 		fmt.Printf(" Agent project dir remapped.")
 	}
@@ -456,11 +464,26 @@ func runRepair(args []string) error {
 	}
 	fmt.Println()
 
-	if err := rebind.RepairTabs(inv, plan, f.yes); err != nil {
+	res, err := rebind.RepairTabs(inv, plan, f.yes)
+	if err != nil {
 		return err
 	}
-	fmt.Println("Done. Primary agent tab + Agents Window glass retagged.")
-	fmt.Println("Reopen this project path in Cursor.")
+	fmt.Println("Done. Primary IDE tab + Agents Window glass identity repaired.")
+	if res != nil && res.PrimaryComposerID != "" {
+		fmt.Printf("Primary composer: %s\n", res.PrimaryComposerID)
+	}
+	if res != nil && res.ComposersRewritten > 0 {
+		fmt.Printf("Rewrote %d composerData blob(s) (trackedGitRepos / embedded paths).\n", res.ComposersRewritten)
+	}
+	if res != nil && (res.GlassProjectsUpdated > 0 || res.GlassKeysMoved > 0) {
+		fmt.Printf("Agents Window: %d project(s), %d glass key(s).\n", res.GlassProjectsUpdated, res.GlassKeysMoved)
+	}
+	fmt.Println("Fully quit Cursor was required; reopen this project path now.")
+	if _, err := os.Stat(f.from); err == nil && !strings.HasSuffix(f.from, ".__rebind_from_unknown") {
+		fmt.Printf("\nIMPORTANT: %s still exists on disk.\n", f.from)
+		fmt.Println("Rename or delete that leftover folder (after quitting Cursor), or Agents Window")
+		fmt.Println("will keep an \"On <old-name>\" bucket and reopen old workspaceStorage.")
+	}
 	return nil
 }
 

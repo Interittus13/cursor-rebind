@@ -57,6 +57,16 @@ func OpenReadWrite(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+// CheckpointWAL flushes the WAL into the main DB file so a later Cursor
+// reopen cannot miss our writes when only the -wal sidecar was updated.
+func CheckpointWAL(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
+
 // SetItemJSON writes a JSON value into ItemTable (insert or replace).
 func SetItemJSON(db *sql.DB, key string, value any) error {
 	raw, err := json.Marshal(value)
@@ -66,11 +76,49 @@ func SetItemJSON(db *sql.DB, key string, value any) error {
 	return SetItemRaw(db, key, raw)
 }
 
-// SetItemRaw writes a raw blob into ItemTable (insert or replace).
+// SetItemRaw writes into ItemTable as SQLITE TEXT, not BLOB.
+// Cursor's storage layer JSON.parses ItemTable values; if they are stored as
+// BLOBs, Electron hands the renderer a Uint8Array and JSON.parse coerces it to
+// "123,34,…" (byte decimals) — which fails with "position 3".
 func SetItemRaw(db *sql.DB, key string, raw []byte) error {
 	_, err := db.Exec(`INSERT INTO ItemTable(key, value) VALUES(?, ?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, raw)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, string(raw))
 	return err
+}
+
+// NormalizeItemTableText rewrites any ItemTable BLOB values to TEXT affinity.
+// Safe for Cursor state DBs: ItemTable is always textual (JSON or plain strings).
+func NormalizeItemTableText(db *sql.DB) (int, error) {
+	res, err := db.Exec(`UPDATE ItemTable SET value = CAST(value AS TEXT) WHERE typeof(value) = 'blob'`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// DeleteItem removes a key from ItemTable.
+func DeleteItem(db *sql.DB, key string) error {
+	_, err := db.Exec(`DELETE FROM ItemTable WHERE key = ?`, key)
+	return err
+}
+
+// ListItemKeysLike returns ItemTable keys matching a SQLite LIKE pattern.
+func ListItemKeysLike(db *sql.DB, like string) ([]string, error) {
+	rows, err := db.Query(`SELECT key FROM ItemTable WHERE key LIKE ?`, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return out, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
 }
 
 // GetItemRaw returns the raw blob for a key.
