@@ -39,15 +39,119 @@ func OpenReadOnly(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-// GetItemJSON loads a JSON value from ItemTable by key.
-func GetItemJSON(db *sql.DB, key string, dest any) (bool, error) {
+// OpenReadWrite opens a Cursor state.vscdb for mutation. Caller must ensure Cursor is closed.
+func OpenReadWrite(dbPath string) (*sql.DB, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("stat %s: %w", dbPath, err)
+	}
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
+}
+
+// CheckpointWAL flushes the WAL into the main DB file so a later Cursor
+// reopen cannot miss our writes when only the -wal sidecar was updated.
+func CheckpointWAL(db *sql.DB) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
+
+// SetItemJSON writes a JSON value into ItemTable (insert or replace).
+func SetItemJSON(db *sql.DB, key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return SetItemRaw(db, key, raw)
+}
+
+// SetItemRaw writes into ItemTable as SQLITE TEXT, not BLOB.
+// Cursor's storage layer JSON.parses ItemTable values; if they are stored as
+// BLOBs, Electron hands the renderer a Uint8Array and JSON.parse coerces it to
+// "123,34,…" (byte decimals) — which fails with "position 3".
+func SetItemRaw(db *sql.DB, key string, raw []byte) error {
+	_, err := db.Exec(`INSERT INTO ItemTable(key, value) VALUES(?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, string(raw))
+	return err
+}
+
+// NormalizeItemTableText rewrites any ItemTable BLOB values to TEXT affinity.
+// Safe for Cursor state DBs: ItemTable is always textual (JSON or plain strings).
+func NormalizeItemTableText(db *sql.DB) (int, error) {
+	res, err := db.Exec(`UPDATE ItemTable SET value = CAST(value AS TEXT) WHERE typeof(value) = 'blob'`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// DeleteItem removes a key from ItemTable.
+func DeleteItem(db *sql.DB, key string) error {
+	_, err := db.Exec(`DELETE FROM ItemTable WHERE key = ?`, key)
+	return err
+}
+
+// ListItemKeysLike returns ItemTable keys matching a SQLite LIKE pattern.
+func ListItemKeysLike(db *sql.DB, like string) ([]string, error) {
+	rows, err := db.Query(`SELECT key FROM ItemTable WHERE key LIKE ?`, like)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return out, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// GetItemRaw returns the raw blob for a key.
+func GetItemRaw(db *sql.DB, key string) ([]byte, bool, error) {
 	var raw []byte
 	err := db.QueryRow(`SELECT value FROM ItemTable WHERE key = ?`, key).Scan(&raw)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+// GetDiskKVRaw returns a value from cursorDiskKV.
+func GetDiskKVRaw(db *sql.DB, key string) ([]byte, bool, error) {
+	var raw []byte
+	err := db.QueryRow(`SELECT value FROM cursorDiskKV WHERE key = ?`, key).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+// GetItemJSON loads a JSON value from ItemTable by key.
+func GetItemJSON(db *sql.DB, key string, dest any) (bool, error) {
+	raw, ok, err := GetItemRaw(db, key)
+	if err != nil || !ok {
+		return ok, err
 	}
 	if err := json.Unmarshal(raw, dest); err != nil {
 		return false, fmt.Errorf("decode %s: %w", key, err)
