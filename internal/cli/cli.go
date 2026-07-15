@@ -23,6 +23,9 @@ var Version = "dev"
 func Execute() error {
 	args := os.Args[1:]
 	if len(args) == 0 {
+		if isInteractiveTTY() {
+			return runInteractiveMenu()
+		}
 		printUsage()
 		return nil
 	}
@@ -56,18 +59,22 @@ func Execute() error {
 func printUsage() {
 	fmt.Fprintf(os.Stdout, `cursor-rebind %s — keep Cursor chats after path or machine changes
 
+Run with no arguments in a terminal for a guided menu.
+
 Usage:
+  cursor-rebind
   cursor-rebind scan [--json]
   cursor-rebind doctor [path] [--json]
   cursor-rebind map --from <old> --to <new> [--prefix] [--json]
-  cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--dry-run|--yes]
-  cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] --yes
+  cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--cleanup] [--dry-run|--yes]
+  cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] [--cleanup] --yes
   cursor-rebind verify [path]
   cursor-rebind restore <backup-id>
   cursor-rebind restore --list
   cursor-rebind version
 
 Commands:
+  (no args) Guided menu (interactive terminal only)
   scan      Inventory workspaces and chat identity
   doctor    Diagnose missing chats for a project path
   map       Build a rebind plan (alias: preview)
@@ -75,6 +82,10 @@ Commands:
   repair    Fix open tabs + Agents Window after a partial migrate (quit Cursor first)
   verify    Count headers/transcripts for a path
   restore   Roll back a migrate backup
+
+Notes:
+  --cleanup  After exact migrate/repair, delete orphaned old workspaceStorage
+             dirs (not your project folder). Refused with --prefix.
 `, Version)
 }
 
@@ -106,11 +117,11 @@ func runScan(args []string) error {
 		enc.SetIndent("", "  ")
 		// Avoid dumping every header entry in default JSON (can be large).
 		type scanOut struct {
-			Roots      paths.Roots            `json:"roots"`
-			Workspaces []discover.Workspace   `json:"workspaces"`
+			Roots      paths.Roots             `json:"roots"`
+			Workspaces []discover.Workspace    `json:"workspaces"`
 			Projects   []discover.AgentProject `json:"projects"`
-			Headers    discover.HeaderIndex   `json:"headers"`
-			ScannedAt  interface{}            `json:"scannedAt"`
+			Headers    discover.HeaderIndex    `json:"headers"`
+			ScannedAt  interface{}             `json:"scannedAt"`
 		}
 		return enc.Encode(scanOut{
 			Roots:      inv.Roots,
@@ -146,7 +157,7 @@ func runScan(args []string) error {
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "EXISTS\tHEADERS\tSCHEMA\tPATH")
+	fmt.Fprintln(w, "ID\tEXISTS\tHEADERS\tSCHEMA\tPATH")
 	for _, ws := range inv.Workspaces {
 		ex := "no"
 		if ws.PathExists {
@@ -159,9 +170,15 @@ func runScan(args []string) error {
 		if path == "" {
 			path = "(no folder)"
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", ex, ws.HeaderChats, ws.Schema, path)
+		id := ws.ID
+		if id == "" {
+			id = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", id, ex, ws.HeaderChats, ws.Schema, path)
 	}
 	_ = w.Flush()
+	fmt.Println()
+	fmt.Println("Tip: pass ID to migrate/repair with --target-id when several rows share the same PATH.")
 
 	fmt.Println()
 	fmt.Println("Agent projects:")
@@ -241,6 +258,7 @@ type pathFlags struct {
 	json     bool
 	dryRun   bool
 	yes      bool
+	cleanup  bool
 	list     bool
 	help     bool
 }
@@ -277,6 +295,8 @@ func parsePathFlags(args []string) (pathFlags, []string, error) {
 			f.dryRun = true
 		case "--yes", "-y":
 			f.yes = true
+		case "--cleanup":
+			f.cleanup = true
 		case "--list":
 			f.list = true
 		case "-h", "--help":
@@ -351,7 +371,7 @@ func runMigrate(args []string) error {
 		return err
 	}
 	if f.help {
-		fmt.Println("Usage: cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--dry-run|--yes]")
+		fmt.Println("Usage: cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--cleanup] [--dry-run|--yes]")
 		return nil
 	}
 	if f.from == "" || f.to == "" {
@@ -359,6 +379,9 @@ func runMigrate(args []string) error {
 	}
 	if f.dryRun && f.yes {
 		return fmt.Errorf("use either --dry-run or --yes, not both")
+	}
+	if f.cleanup && f.prefix {
+		return fmt.Errorf("--cleanup requires exact mode (omit --prefix)")
 	}
 	f.from, f.to = absPath(f.from), absPath(f.to)
 
@@ -382,43 +405,19 @@ func runMigrate(args []string) error {
 	fmt.Print(rebind.FormatPlan(plan))
 	fmt.Println()
 
-	res, err := rebind.Apply(inv, plan, f.yes, f.dryRun)
-	if err != nil {
-		return err
-	}
+	res, err := rebind.Apply(inv, plan, f.yes, f.dryRun, f.cleanup)
 	if f.dryRun {
+		if err != nil {
+			return err
+		}
 		fmt.Println("Dry run only — no files were changed.")
 		fmt.Println("Quit Cursor, then re-run with --yes to apply.")
 		return nil
 	}
-	fmt.Printf("Done. Updated %d header(s)", res.HeadersUpdated)
-	if res.HeadersAdded > 0 {
-		fmt.Printf(", added %d", res.HeadersAdded)
+	printMigrateResult(res)
+	if err != nil {
+		return err
 	}
-	fmt.Printf(".")
-	if res.HeadersUpdated == 0 && res.HeadersAdded == 0 {
-		fmt.Printf(" (headers already on --to)")
-	}
-	if res.ComposersRewritten > 0 {
-		fmt.Printf(" Rewrote %d composerData blob(s).", res.ComposersRewritten)
-	}
-	if res.GlassProjectsUpdated > 0 || res.GlassKeysMoved > 0 {
-		fmt.Printf(" Agents Window: %d project(s), %d glass key(s).", res.GlassProjectsUpdated, res.GlassKeysMoved)
-	}
-	if res.ProjectMoved {
-		fmt.Printf(" Agent project dir remapped.")
-	}
-	fmt.Println()
-	if res.TranscriptsWritten > 0 {
-		fmt.Printf("Wrote %d agent-transcripts JSONL file(s) for Agents Window history.\n", res.TranscriptsWritten)
-	}
-	if res.BackupID != "" {
-		fmt.Printf("Backup: %s (cursor-rebind restore %s)\n", res.BackupID, res.BackupID)
-	}
-	if res.TargetWSID != "" {
-		fmt.Printf("Target workspace id: %s\n", res.TargetWSID)
-	}
-	fmt.Println("Fully quit Cursor (not just reload), then reopen this project path.")
 	return nil
 }
 
@@ -428,7 +427,10 @@ func runRepair(args []string) error {
 		return err
 	}
 	if f.help {
-		fmt.Println("Usage: cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] --yes")
+		fmt.Println("Usage: cursor-rebind repair --to <path> [--from <old>] [--target-id <id>] [--cleanup] --yes")
+		fmt.Println()
+		fmt.Println("With only --to, consolidates dual workspaceStorage ids for that folder")
+		fmt.Println("(moves named chats onto the empty shell Cursor opens, orphans leftovers).")
 		return nil
 	}
 	if f.to == "" {
@@ -467,10 +469,7 @@ func runRepair(args []string) error {
 	}
 	fmt.Println()
 
-	res, err := rebind.RepairTabs(inv, plan, f.yes)
-	if err != nil {
-		return err
-	}
+	res, err := rebind.RepairTabs(inv, plan, f.yes, f.cleanup)
 	fmt.Println("Done. Primary IDE tab + Agents Window glass identity repaired.")
 	if res != nil && res.BackupID != "" {
 		fmt.Printf("Backup: %s\n", res.BackupID)
@@ -487,13 +486,62 @@ func runRepair(args []string) error {
 	if res != nil && res.TranscriptsWritten > 0 {
 		fmt.Printf("Wrote %d agent-transcripts JSONL file(s) for Agents Window history.\n", res.TranscriptsWritten)
 	}
+	if res != nil && res.SourceStoragePurged > 0 {
+		fmt.Printf("Removed %d old workspaceStorage / project leftover(s).\n", res.SourceStoragePurged)
+	}
+	if res != nil && res.HealthOK {
+		fmt.Println("Workspace health: healthy (single live id for --to).")
+	}
 	fmt.Println("Fully quit Cursor was required; reopen this project path now.")
-	if _, err := os.Stat(f.from); err == nil && !strings.HasSuffix(f.from, ".__rebind_from_unknown") {
+	if _, err2 := os.Stat(f.from); err2 == nil && !strings.HasSuffix(f.from, ".__rebind_from_unknown") {
 		fmt.Printf("\nIMPORTANT: %s still exists on disk.\n", f.from)
 		fmt.Println("Rename or delete that leftover folder (after quitting Cursor), or Agents Window")
 		fmt.Println("will keep an \"On <old-name>\" bucket and reopen old workspaceStorage.")
 	}
+	if err != nil {
+		return err
+	}
 	return nil
+}
+
+func printMigrateResult(res *rebind.Result) {
+	if res == nil {
+		return
+	}
+	fmt.Printf("Done. Updated %d header(s)", res.HeadersUpdated)
+	if res.HeadersAdded > 0 {
+		fmt.Printf(", added %d", res.HeadersAdded)
+	}
+	fmt.Printf(".")
+	if res.HeadersUpdated == 0 && res.HeadersAdded == 0 {
+		fmt.Printf(" (headers already on --to)")
+	}
+	if res.ComposersRewritten > 0 {
+		fmt.Printf(" Rewrote %d composerData blob(s).", res.ComposersRewritten)
+	}
+	if res.GlassProjectsUpdated > 0 || res.GlassKeysMoved > 0 {
+		fmt.Printf(" Agents Window: %d project(s), %d glass key(s).", res.GlassProjectsUpdated, res.GlassKeysMoved)
+	}
+	if res.ProjectMoved {
+		fmt.Printf(" Agent project dir remapped.")
+	}
+	fmt.Println()
+	if res.TranscriptsWritten > 0 {
+		fmt.Printf("Wrote %d agent-transcripts JSONL file(s) for Agents Window history.\n", res.TranscriptsWritten)
+	}
+	if res.SourceStoragePurged > 0 {
+		fmt.Printf("Removed %d old workspaceStorage / project leftover(s).\n", res.SourceStoragePurged)
+	}
+	if res.BackupID != "" {
+		fmt.Printf("Backup: %s (cursor-rebind restore %s)\n", res.BackupID, res.BackupID)
+	}
+	if res.TargetWSID != "" {
+		fmt.Printf("Target workspace id: %s\n", res.TargetWSID)
+	}
+	if res.HealthOK {
+		fmt.Println("Workspace health: healthy (single live id for --to).")
+	}
+	fmt.Println("Fully quit Cursor (not just reload), then reopen this project path.")
 }
 
 func runVerify(args []string) error {
@@ -526,19 +574,28 @@ func runVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	exact, loose, agent := rebind.Verify(inv, pathArg)
+	rep := rebind.VerifyPath(inv, pathArg)
 	fmt.Printf("cursor-rebind verify\n")
 	fmt.Printf("====================\n")
 	fmt.Printf("Path:              %s\n", pathArg)
-	fmt.Printf("Exact headers:     %d\n", exact)
-	fmt.Printf("Same-name (other): %d\n", loose)
-	fmt.Printf("Agent transcripts: %d\n", agent)
-	if exact > 0 && loose == 0 {
+	fmt.Printf("Exact headers:     %d\n", rep.Exact)
+	fmt.Printf("Same-name (other): %d\n", rep.Loose)
+	fmt.Printf("Agent transcripts: %d\n", rep.Agent)
+	if rep.Health != nil {
+		fmt.Print(rebind.FormatHealthHuman(rep.Health))
+	}
+	switch {
+	case rep.Health != nil && !rep.Health.OK:
+		fmt.Println("Status:            SPLIT-BRAIN — repair before relying on IDE/Agents history")
+	case rep.Exact > 0 && rep.Loose == 0:
 		fmt.Println("Status:            healthy")
-	} else if loose > 0 {
+	case rep.Loose > 0:
 		fmt.Println("Status:            orphans remain — consider migrate")
-	} else {
+	default:
 		fmt.Println("Status:            no headers for this path")
+	}
+	if rep.Health != nil && !rep.Health.OK {
+		return fmt.Errorf("verify failed: dual workspace identity for %s", pathArg)
 	}
 	return nil
 }
@@ -578,4 +635,3 @@ func runRestore(args []string) error {
 	fmt.Printf("Restored backup %s. Reopen Cursor to load it.\n", pos[0])
 	return nil
 }
-

@@ -58,15 +58,18 @@ type Op struct {
 
 // Result is the outcome of Apply.
 type Result struct {
-	BackupID             string `json:"backupId"`
-	HeadersUpdated       int    `json:"headersUpdated"`
-	HeadersAdded         int    `json:"headersAdded"`
-	ComposersRewritten   int    `json:"composersRewritten"`
-	GlassProjectsUpdated int    `json:"glassProjectsUpdated"`
-	GlassKeysMoved       int    `json:"glassKeysMoved"`
-	ProjectMoved         bool   `json:"projectMoved"`
-	TranscriptsWritten   int    `json:"transcriptsWritten,omitempty"`
-	TargetWSID           string `json:"targetWorkspaceId"`
+	BackupID             string   `json:"backupId"`
+	HeadersUpdated       int      `json:"headersUpdated"`
+	HeadersAdded         int      `json:"headersAdded"`
+	ComposersRewritten   int      `json:"composersRewritten"`
+	GlassProjectsUpdated int      `json:"glassProjectsUpdated"`
+	GlassKeysMoved       int      `json:"glassKeysMoved"`
+	ProjectMoved         bool     `json:"projectMoved"`
+	TranscriptsWritten   int      `json:"transcriptsWritten,omitempty"`
+	SourceStoragePurged  int      `json:"sourceStoragePurged,omitempty"`
+	TargetWSID           string   `json:"targetWorkspaceId"`
+	HealthOK             bool     `json:"healthOk"`
+	HealthIssues         []string `json:"healthIssues,omitempty"`
 }
 
 // BuildPlan constructs a rebind plan from inventory + from/to.
@@ -102,6 +105,14 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 	}
 	if p.TargetWSID == "" && mode == ModeExact {
 		p.Warnings = append(p.Warnings, "no workspaceStorage entry for target yet — a new id will be created on apply if needed")
+	}
+	if mode == ModeExact {
+		if live := liveWorkspaceIDs(inv, to); len(live) > 1 {
+			p.Warnings = append(p.Warnings, fmt.Sprintf(
+				"SPLIT-BRAIN risk: %d live workspace ids for --to (%s); migrate attaches chats to %s and orphans the rest",
+				len(live), strings.Join(live, ", "), p.TargetWSID,
+			))
+		}
 	}
 
 	p.SourceWSIDs = findSourceWorkspaceIDs(inv, from, to, p.TargetWSID, mode)
@@ -311,11 +322,13 @@ func pickTargetWorkspaceID(inv *discover.Inventory, to string) string {
 	}
 
 	// Multiple workspaceStorage entries for the same folder (common after rename).
-	// Attach chats onto the shell Cursor opens for the new path: fewest *contentful*
-	// composers, then newest mtime. Do NOT prefer fewest raw tab IDs — empty
-	// "New Agent" stubs inflate counts and previously inverted source/target.
+	// Attach chats onto the shell Cursor opens for the new path: fewest *named*
+	// global headers (data leftover vs empty reminted shell), then fewest local
+	// contentful tabs, then newest mtime. Never prefer the data-holding leftover —
+	// deleting the empty shell makes Cursor remint it and leaves IDE/Agents blank.
 	type scored struct {
 		id         string
+		named      int
 		contentful int
 		modTime    time.Time
 	}
@@ -328,6 +341,7 @@ func pickTargetWorkspaceID(inv *discover.Inventory, to string) string {
 	}
 	list := make([]scored, 0, len(candidates))
 	for _, w := range candidates {
+		named := namedHeaderCount(inv, w.ID)
 		ids := readWorkspaceComposerIDs(filepath.Join(inv.Roots.WorkspaceStorage, w.ID, "state.vscdb"))
 		contentful := 0
 		if gdb != nil {
@@ -337,13 +351,21 @@ func pickTargetWorkspaceID(inv *discover.Inventory, to string) string {
 				}
 			}
 		}
-		list = append(list, scored{id: w.ID, contentful: contentful, modTime: w.ModTime})
+		list = append(list, scored{id: w.ID, named: named, contentful: contentful, modTime: w.ModTime})
 	}
 
 	best := list[0]
 	for _, s := range list[1:] {
-		if s.contentful < best.contentful ||
-			(s.contentful == best.contentful && s.modTime.After(best.modTime)) {
+		switch {
+		case s.named < best.named:
+			best = s
+		case s.named > best.named:
+			continue
+		case s.contentful < best.contentful:
+			best = s
+		case s.contentful > best.contentful:
+			continue
+		case s.modTime.After(best.modTime):
 			best = s
 		}
 	}
@@ -687,7 +709,9 @@ func FormatPlan(p *Plan) string {
 }
 
 // Apply executes the plan. dryRun skips mutations.
-func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, error) {
+// cleanup, when true, removes orphaned source workspaceStorage dirs after a
+// successful exact-mode identity pass (refused with --prefix).
+func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun, cleanup bool) (*Result, error) {
 	touchable := plan.HeadersMatched > 0 || plan.ComposersFromWS > 0 || plan.ProjectExists ||
 		len(plan.SourceWSIDs) > 0 || plan.SourceInventory.HasContentful() ||
 		plan.Strategy == StrategyCreate
@@ -696,6 +720,9 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 	}
 	if !yes && !dryRun {
 		return nil, fmt.Errorf("refusing to write without --yes (use --dry-run to preview)")
+	}
+	if cleanup && plan.Mode == ModePrefix {
+		return nil, fmt.Errorf("--cleanup requires exact mode (omit --prefix)")
 	}
 	if !dryRun {
 		if err := guard.EnsureCursorClosed(); err != nil {
@@ -769,8 +796,12 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 		if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
 			return nil, fmt.Errorf("normalize storage text: %w", err)
 		}
+		res.HealthOK = true
 	} else {
-		idRes, err := applyExactIdentity(inv, plan, exactIdentityOpts{rewriteProjects: true})
+		idRes, err := applyExactIdentity(inv, plan, exactIdentityOpts{
+			rewriteProjects:      true,
+			cleanupSourceStorage: cleanup,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -779,6 +810,16 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 		res.GlassKeysMoved = idRes.GlassKeysMoved
 		res.ProjectMoved = idRes.ProjectMoved
 		res.TranscriptsWritten = idRes.TranscriptsWritten
+		res.SourceStoragePurged = idRes.SourceStoragePurged
+
+		if err := enforceExactHealth(inv.Roots, plan.To, plan.TargetWSID, res.BackupID); err != nil {
+			if ue, ok := err.(*UnhealthyError); ok && ue.Report != nil {
+				res.HealthOK = false
+				res.HealthIssues = append([]string{}, ue.Report.Issues...)
+			}
+			return res, err
+		}
+		res.HealthOK = true
 	}
 
 	return res, nil
@@ -787,6 +828,8 @@ func Apply(inv *discover.Inventory, plan *Plan, yes, dryRun bool) (*Result, erro
 type exactIdentityOpts struct {
 	// rewriteProjects moves/merges ~/.cursor/projects (migrate only; repair skips).
 	rewriteProjects bool
+	// cleanupSourceStorage removes orphaned source workspaceStorage after success.
+	cleanupSourceStorage bool
 }
 
 type exactIdentityResult struct {
@@ -796,6 +839,7 @@ type exactIdentityResult struct {
 	GlassKeysMoved       int
 	ProjectMoved         bool
 	TranscriptsWritten   int
+	SourceStoragePurged  int
 }
 
 // applyExactIdentity runs the exact-mode identity pass shared by Apply and RepairTabs.
@@ -839,6 +883,13 @@ func applyExactIdentity(inv *discover.Inventory, plan *Plan, opts exactIdentityO
 	out.TranscriptsWritten = tn
 	if err := normalizeStorageText(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
 		return nil, fmt.Errorf("normalize storage text: %w", err)
+	}
+	if opts.cleanupSourceStorage {
+		n, _, err := purgeSourceStorage(inv.Roots.WorkspaceStorage, inv.Roots.ProjectsDir, plan)
+		if err != nil {
+			return nil, fmt.Errorf("purge source storage: %w", err)
+		}
+		out.SourceStoragePurged = n
 	}
 	return out, nil
 }
@@ -1645,7 +1696,7 @@ func buildComposerEditorState(composerIDs []string) map[string]any {
 	mru := make([]any, 0, len(composerIDs))
 	for i, id := range composerIDs {
 		val, _ := json.Marshal(map[string]any{
-			"composerId":                 id,
+			"composerId":                  id,
 			"restoreInRegularEditorGroup": true,
 		})
 		editors = append(editors, map[string]any{
@@ -1900,13 +1951,17 @@ type RepairResult struct {
 	GlassProjectsUpdated int
 	GlassKeysMoved       int
 	TranscriptsWritten   int
+	SourceStoragePurged  int
+	HealthOK             bool
+	HealthIssues         []string
 }
 
 // RepairTabs rebinds IDE open-tab + Agents Window identity after a partial migrate.
 // Unlike Apply, it does not require contentful chats still sitting on --from — it
 // still rewrites headers (to drop empty --from stubs), composerData, glass, and
 // retires leftover --from Agents roots that keep showing the old machine path.
-func RepairTabs(inv *discover.Inventory, plan *Plan, yes bool) (*RepairResult, error) {
+// cleanup removes orphaned source workspaceStorage after success (opt-in).
+func RepairTabs(inv *discover.Inventory, plan *Plan, yes, cleanup bool) (*RepairResult, error) {
 	if plan == nil {
 		return nil, fmt.Errorf("nil plan")
 	}
@@ -1944,18 +1999,31 @@ func RepairTabs(inv *discover.Inventory, plan *Plan, yes bool) (*RepairResult, e
 	if _, _, err := rewriteHeaders(inv.Roots.GlobalDB, inv.Roots.WorkspaceStorage, plan); err != nil {
 		return nil, fmt.Errorf("repair headers: %w", err)
 	}
-	idRes, err := applyExactIdentity(inv, plan, exactIdentityOpts{rewriteProjects: false})
+	idRes, err := applyExactIdentity(inv, plan, exactIdentityOpts{
+		rewriteProjects:      false,
+		cleanupSourceStorage: cleanup,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("repair: %w", err)
 	}
-	return &RepairResult{
+	out := &RepairResult{
 		BackupID:             id,
 		PrimaryComposerID:    idRes.PrimaryComposerID,
 		ComposersRewritten:   idRes.ComposersRewritten,
 		GlassProjectsUpdated: idRes.GlassProjectsUpdated,
 		GlassKeysMoved:       idRes.GlassKeysMoved,
 		TranscriptsWritten:   idRes.TranscriptsWritten,
-	}, nil
+		SourceStoragePurged:  idRes.SourceStoragePurged,
+	}
+	if err := enforceExactHealth(inv.Roots, plan.To, plan.TargetWSID, id); err != nil {
+		if ue, ok := err.(*UnhealthyError); ok && ue.Report != nil {
+			out.HealthOK = false
+			out.HealthIssues = append([]string{}, ue.Report.Issues...)
+		}
+		return out, err
+	}
+	out.HealthOK = true
+	return out, nil
 }
 
 func normalizeStorageText(globalDB, wsRoot string, plan *Plan) error {
@@ -1989,10 +2057,25 @@ func normalizeStorageText(globalDB, wsRoot string, plan *Plan) error {
 	return nil
 }
 
+// VerifyReport is the outcome of VerifyPath.
+type VerifyReport struct {
+	Exact   int
+	Loose   int
+	Agent   int
+	Health  *HealthReport
+}
+
 // Verify reports how many headers currently point at path.
 func Verify(inv *discover.Inventory, path string) (exact, loose int, agent int) {
+	rep := VerifyPath(inv, path)
+	return rep.Exact, rep.Loose, rep.Agent
+}
+
+// VerifyPath counts headers/transcripts and assesses dual-workspace health.
+func VerifyPath(inv *discover.Inventory, path string) VerifyReport {
 	path = filepath.Clean(path)
 	base := filepath.Base(path)
+	var exact, loose, agent int
 	for _, e := range inv.Headers.Entries {
 		if e.WorkspacePath == "" {
 			continue
@@ -2010,7 +2093,12 @@ func Verify(inv *discover.Inventory, path string) (exact, loose int, agent int) 
 			agent += p.TranscriptCount
 		}
 	}
-	return exact, loose, agent
+	return VerifyReport{
+		Exact:  exact,
+		Loose:  loose,
+		Agent:  agent,
+		Health: AssessPathHealth(inv, path, ""),
+	}
 }
 
 // Restore applies a backup by id.

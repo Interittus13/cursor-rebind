@@ -122,6 +122,18 @@ cursor-rebind restore <backup-id>
 
 Use these to undo a bad migrate/repair on the **current** machine. They are not a substitute for the machine-move archive above.
 
+## Optional `--cleanup` after exact migrate
+
+Exact migrate path-orphans old `workspaceStorage` dirs by default (safe). After you confirm IDE + Agents look right, you can delete those orphans:
+
+```bash
+cursor-rebind migrate --from … --to … --yes --cleanup
+```
+
+Or answer Yes to the cleanup prompt in the guided menu (`cursor-rebind` with no args).
+
+`--cleanup` never deletes your project folder on disk. It is refused with `--prefix`. Prefer archiving `globalStorage` + `workspaceStorage` for machine moves; cleanup is not a substitute for that archive.
+
 ## Checklist
 
 - [ ] Cursor fully quit on the old machine
@@ -130,4 +142,19 @@ Use these to undo a bad migrate/repair on the **current** machine. They are not 
 - [ ] Cursor fully quit before any migrate/repair
 - [ ] Ran prefix migrate if home/username changed
 - [ ] Ran exact migrate/repair per project you care about (especially Agents)
+- [ ] Optional: `--cleanup` after confirming chats look correct
 - [ ] Verified with `cursor-rebind doctor <path>` / `verify <path>` and a real reopen in Cursor
+- [ ] No `SPLIT-BRAIN` in verify/doctor (if seen: `repair --to <path> --yes` after quitting Cursor)
+
+## Dual workspace ids (split-brain)
+
+After a rename or machine move, Cursor may leave **two** `workspaceStorage/<id>/` folders whose `workspace.json` both point at the same path: an empty shell it opens, and a leftover that still holds named chats. IDE history then looks empty while Agents Window may group chats under the GitHub repo name.
+
+**Rule:** always attach chats onto the shell Cursor opens (fewest named chats / newest empty id), then orphan the other. Do not delete the shell and keep the leftover.
+
+```bash
+cursor-rebind doctor /path/to/project   # look for SPLIT-BRAIN
+# quit Cursor fully
+cursor-rebind repair --to /path/to/project --yes
+cursor-rebind verify /path/to/project
+```
