@@ -108,6 +108,7 @@ After a successful **exact** migrate/repair, `--cleanup` deletes:
 - Leftover `~/.cursor/projects/<old-slug>` if still present
 
 It does **not** delete your project folder on disk, global chat blobs (already retagged), or the target workspace. Refused with `--prefix`. Tool `restore` may not fully recreate purged workspace trees (DB files were backed up; full dir trees were not).
+
 ### Machine move / OS reinstall / username change
 
 Copying only `workspaceStorage` is not enough. Chat headers, composer blobs, and Agents glass state live mainly in **globalStorage**. See the full playbook:
