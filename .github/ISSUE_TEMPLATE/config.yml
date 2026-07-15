@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/Interittus13/cursor-rebind/security/advisories/new
+    about: Please report vulnerabilities privately — see SECURITY.md
+  - name: Usage / machine move questions
+    url: https://github.com/Interittus13/cursor-rebind/blob/main/docs/machine-move.md
+    about: Backup and restore steps before opening a support issue

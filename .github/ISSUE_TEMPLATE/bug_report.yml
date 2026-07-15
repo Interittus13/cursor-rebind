@@ -1,0 +1,70 @@
+name: Bug report
+description: Something broke while scanning, migrating, or repairing chats
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fully quit Cursor before reproduce steps that write. Do not paste private chat contents.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong in one or two sentences?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands (redact personal paths if needed).
+      placeholder: |
+        1. Quit Cursor
+        2. cursor-rebind map --from ... --to ...
+        3. cursor-rebind migrate ... --yes
+        4. Reopen project — IDE / Agents behavior?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface failed?
+      multiple: true
+      options:
+        - IDE chat sidebar
+        - Agents Window
+        - Both
+        - CLI only (scan/map/doctor)
+        - Backup / restore
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: e.g. Ubuntu 24.04, macOS 15, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: cursor-rebind version
+      description: Output of `cursor-rebind version`
+    validations:
+      required: true
+  - type: input
+    id: cursor
+    attributes:
+      label: Cursor version (if known)
+  - type: textarea
+    id: extras
+    attributes:
+      label: Extra context
+      description: doctor/verify output snippets, whether you used --prefix, --target-id, repair, etc.
