@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an improvement to cursor-rebind
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What friction or gap are you hitting?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should cursor-rebind do differently?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Likely scope
+      options:
+        - label: CLI / docs only
+        - label: Exact migrate / repair behavior
+        - label: Prefix / machine-move flow
+        - label: New Cursor storage keys / Agents surfaces
