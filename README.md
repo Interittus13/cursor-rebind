@@ -45,6 +45,9 @@ Download the Windows archive from [Releases](https://github.com/Interittus13/cur
 ## Usage
 
 ```bash
+# Guided menu (interactive terminal; recommended for first-time users)
+cursor-rebind
+
 cursor-rebind scan
 cursor-rebind doctor /path/to/project
 
@@ -54,13 +57,23 @@ cursor-rebind map --from /old/path --to /new/path
 # Apply (quit Cursor fully first)
 cursor-rebind migrate --from /old/path --to /new/path --yes
 
+# Same, and delete orphaned old workspaceStorage afterward (opt-in)
+cursor-rebind migrate --from /old/path --to /new/path --yes --cleanup
+
 # Repair Agents/IDE identity after a partial migrate (quit Cursor first)
 cursor-rebind repair --to /new/path --from /old/path --target-id <workspace-id> --yes
+
+# Consolidate dual workspace ids for one folder (chats on leftover, Cursor opens empty shell)
+cursor-rebind repair --to /path/to/project --yes
 
 cursor-rebind verify /new/path
 cursor-rebind restore --list
 cursor-rebind version
 ```
+
+### Guided mode
+
+Running `cursor-rebind` with **no arguments** in a real terminal opens a menu (migrate, repair, scan, machine-move tips). Scripts and piped stdin still get the normal usage text. Flag-based commands stay fully supported for automation.
 
 ### Folder rename (same machine)
 
@@ -73,9 +86,11 @@ The primary path. After renaming a project dir:
 ```bash
 cursor-rebind map --from /old/path/to/xyz --to /new/path/to/abc
 cursor-rebind migrate --from /old/path/to/xyz --to /new/path/to/abc --yes
+# Optional: also purge orphaned old workspace data
+cursor-rebind migrate --from /old/path/to/xyz --to /new/path/to/abc --yes --cleanup
 ```
 
-4. Prefer `--target-id` when `scan` shows multiple workspace entries for the same folder.
+4. Prefer `--target-id` when `scan` shows multiple workspace entries for the same folder (`scan` prints each workspace ID).
 5. Remove or rename any leftover empty `--from` directory, then reopen only `--to`.
 
 Exact-mode migrate updates both surfaces:
@@ -85,6 +100,14 @@ Exact-mode migrate updates both surfaces:
 
 `Updated 0 header(s)` is OK when headers already point at `--to`.
 
+### `--cleanup` (opt-in)
+
+After a successful **exact** migrate/repair, `--cleanup` deletes:
+
+- Orphaned `workspaceStorage/<old-id>/` directories (already pointed at `.__rebind_orphan_*`)
+- Leftover `~/.cursor/projects/<old-slug>` if still present
+
+It does **not** delete your project folder on disk, global chat blobs (already retagged), or the target workspace. Refused with `--prefix`. Tool `restore` may not fully recreate purged workspace trees (DB files were backed up; full dir trees were not).
 ### Machine move / OS reinstall / username change
 
 Copying only `workspaceStorage` is not enough. Chat headers, composer blobs, and Agents glass state live mainly in **globalStorage**. See the full playbook:
@@ -108,8 +131,11 @@ cursor-rebind migrate --from /home/olduser --to /home/newuser --prefix --yes
 
 - Quit Cursor completely before `migrate` / `repair` (reload is not enough).
 - Prefer `--target-id` when multiple `workspaceStorage` entries exist for the same folder.
+- **Never delete the empty shell** Cursor minted for `--to` and consolidate onto the older data leftover — Cursor remints that shell and IDE/Agents stay empty. Migrate/repair attach chats **onto** the emptiest/newest shell, then orphan siblings.
+- Exact `migrate` / `repair` run a post-apply **health check** (single live workspace id + named chats on that id). Failure exits non-zero with a `repair --to` hint; use `verify` / `doctor` to detect `SPLIT-BRAIN`.
 - `migrate` strategy (`create` / `replace-empty` / `merge`) chooses plan messaging and which chat becomes the primary tab. Apply steps are the same; **merge does not combine two threads into one**.
 - Tool backups from migrate/repair live under `~/.cursor-rebind/backups/` and can be listed with `cursor-rebind restore --list`.
+- Use `--cleanup` only after you are happy with the migrate; default is to keep path-orphaned storage as a safety net.
 
 ## How it works
 

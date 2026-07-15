@@ -96,10 +96,12 @@ func diagnose(r *Report) (diag, next []string) {
 	}
 
 	hasCurrentWS := false
+	liveExact := 0
 	for _, w := range r.Workspaces {
-		if filepath.Clean(w.FolderPath) == r.AbsPath && w.PathExists {
+		fp := filepath.Clean(w.FolderPath)
+		if fp == r.AbsPath && !strings.Contains(fp, ".__rebind_orphan_") {
+			liveExact++
 			hasCurrentWS = true
-			break
 		}
 	}
 
@@ -118,6 +120,45 @@ func diagnose(r *Report) (diag, next []string) {
 		}
 	}
 
+	// Dual workspaceStorage identity (same folder, multiple live ids).
+	if liveExact > 1 {
+		ids := make([]string, 0, liveExact)
+		namedBy := map[string]int{}
+		for _, w := range r.Workspaces {
+			if filepath.Clean(w.FolderPath) != r.AbsPath {
+				continue
+			}
+			if strings.Contains(w.FolderPath, ".__rebind_orphan_") {
+				continue
+			}
+			ids = append(ids, w.ID)
+		}
+		for _, e := range r.ExactHeaders {
+			if e.WorkspaceID == "" {
+				continue
+			}
+			name := strings.TrimSpace(e.Name)
+			switch strings.ToLower(name) {
+			case "", "new agent", "new chat", "restored chat", "untitled", "composer":
+				continue
+			}
+			namedBy[e.WorkspaceID]++
+		}
+		diag = append(diag, fmt.Sprintf(
+			"SPLIT-BRAIN: %d live workspaceStorage ids for this folder (%s). Cursor may open an empty shell while named chats sit on a sibling id.",
+			liveExact, strings.Join(ids, ", "),
+		))
+		for wid, n := range namedBy {
+			diag = append(diag, fmt.Sprintf("  - %d named chat(s) on workspace id %s", n, wid))
+		}
+		next = append(next,
+			"Close Cursor completely.",
+			fmt.Sprintf("Consolidate onto the empty shell Cursor opens: cursor-rebind repair --to %s --yes", r.AbsPath),
+			"Prefer --target-id from scan when two ids share PATH (use the id with fewer named chats).",
+			fmt.Sprintf("Then: cursor-rebind verify %s", r.AbsPath),
+		)
+	}
+
 	switch {
 	case orphanHeaderCount > 0 && len(r.ExactHeaders) == 0:
 		diag = append(diag, fmt.Sprintf(
@@ -132,9 +173,9 @@ func diagnose(r *Report) (diag, next []string) {
 			"Split identity: %d header(s) on current path, %d still on old path(s).",
 			len(r.ExactHeaders), orphanHeaderCount,
 		))
-	case len(r.ExactHeaders) > 0:
+	case len(r.ExactHeaders) > 0 && liveExact <= 1:
 		diag = append(diag, fmt.Sprintf("Global index has %d chat(s) for this exact path.", len(r.ExactHeaders)))
-	default:
+	case len(r.ExactHeaders) == 0 && liveExact <= 1:
 		diag = append(diag, "No global composer headers found for this project path.")
 	}
 
@@ -156,7 +197,9 @@ func diagnose(r *Report) (diag, next []string) {
 		diag = append(diag, "No workspaceStorage entry mapped to this exact path yet (open the folder in Cursor once).")
 	}
 
-	if orphanHeaderCount > 0 || (oldAgent > 0 && len(r.ExactHeaders) == 0) {
+	if liveExact > 1 {
+		// next steps already set for split-brain
+	} else if orphanHeaderCount > 0 || (oldAgent > 0 && len(r.ExactHeaders) == 0) {
 		next = append(next,
 			"Your chats are still on disk — they are linked to the old project path.",
 			"Close Cursor completely before rebinding.",

@@ -70,9 +70,9 @@ func TestBuildPlanPrefersEmptyShellTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Without readable DBs, contentful counts are 0 for both → newest mtime wins.
+	// Without readable DBs and without named headers, contentful ties → newest mtime wins.
 	if plan.TargetWSID != "dataws" {
-		t.Fatalf("target=%s want dataws (newest when contentful tied)", plan.TargetWSID)
+		t.Fatalf("target=%s want dataws (newest when named+contentful tied)", plan.TargetWSID)
 	}
 	if len(plan.SourceWSIDs) == 0 {
 		t.Fatalf("expected sources, got none; target=%s", plan.TargetWSID)

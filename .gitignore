@@ -7,6 +7,9 @@
 /dist/
 /coverage.out
 /goreleaser
+/.tmp/
+/.gocache/
+/.gomodcache/
 
 # Editor / OS
 .DS_Store
