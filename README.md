@@ -1,10 +1,41 @@
 # cursor-rebind
 
-Move a project. Switch machines. Keep your Cursor chats.
+[![Release](https://img.shields.io/github/v/release/Interittus13/cursor-rebind?display_name=tag)](https://github.com/Interittus13/cursor-rebind/releases/latest)
+[![Go](https://img.shields.io/github/go-mod/go-version/Interittus13/cursor-rebind)](https://github.com/Interittus13/cursor-rebind/blob/main/go.mod)
+[![License](https://img.shields.io/github/license/Interittus13/cursor-rebind)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/Interittus13/cursor-rebind/ci.yml?branch=main&label=CI)](https://github.com/Interittus13/cursor-rebind/actions/workflows/ci.yml)
 
-When a folder path changes, Cursor treats it as a new workspace. Your conversations are still on disk — they just lose their identity. cursor-rebind finds them and puts them back where they belong.
+**Your Cursor chats. Still yours — wherever the project goes.**
 
-Works on Linux, macOS, and Windows.
+Rename a folder. Move machines. Change a username. The conversations don’t vanish; they just lose their place. cursor-rebind brings them home — IDE sidebar and Agents Window, together again.
+
+Works on **Linux**, **macOS**, and **Windows**.
+
+cursor-rebind is an independent, community project. It is **not** affiliated with, endorsed by, or sponsored by Anysphere, Inc. or Cursor.
+
+## Quick start
+
+```bash
+# Install (Linux / macOS)
+curl -fsSL https://raw.githubusercontent.com/Interittus13/cursor-rebind/main/scripts/install.sh | bash
+
+# Quit Cursor completely, then:
+cursor-rebind map --from /old/path/to/project --to /new/path/to/project
+cursor-rebind migrate --from /old/path/to/project --to /new/path/to/project --yes
+cursor-rebind verify /new/path/to/project
+```
+
+First time? Run `cursor-rebind` with no args for a guided menu.
+
+## When you need this
+
+| Situation | What usually breaks |
+|-----------|---------------------|
+| Renamed / moved a project folder | IDE history empty or “New Agent” only |
+| New laptop / OS reinstall / username change | Chats still under the old home path |
+| Agents Window shows repo chats but IDE does not | Dual `workspaceStorage` ids (SPLIT-BRAIN) |
+
+**Not** a Cursor cloud sync tool — it rewrites **local** storage identity (`globalStorage` + `workspaceStorage` + Agents glass state).
 
 ## Install
 
@@ -150,6 +181,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Please read the [Code of Conduct](CODE_O
 
 See [CHANGELOG.md](CHANGELOG.md).
 
-## License
+## Disclaimer
 
-[MIT](LICENSE)
+cursor-rebind is an independent open-source tool. It is **not affiliated with, endorsed by, or sponsored by Anysphere, Inc. or Cursor**. “Cursor” and related marks are trademarks of their respective owners. Use at your own risk; always quit Cursor and keep backups before rewriting local storage.
