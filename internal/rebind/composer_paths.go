@@ -57,8 +57,8 @@ func rewriteComposerDiskPaths(globalDB string, plan *Plan) (int, error) {
 
 func loadHeaderMap(db *sql.DB) map[string]vscdb.ComposerMeta {
 	out := map[string]vscdb.ComposerMeta{}
-	var headers vscdb.ComposerHeaders
-	if ok, _ := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers); !ok {
+	headers, src, err := vscdb.LoadComposerHeaders(db)
+	if err != nil || src == vscdb.HeadersNone {
 		return out
 	}
 	for _, c := range headers.AllComposers {
