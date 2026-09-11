@@ -232,7 +232,7 @@ func BuildPlanWithTarget(inv *discover.Inventory, from, to string, mode Mode, ta
 	}
 	p.Ops = append(p.Ops, Op{
 		Kind:   "rewrite-headers",
-		Detail: fmt.Sprintf("IDE: retag/register composer.composerHeaders for %s → %s", from, to),
+		Detail: fmt.Sprintf("IDE: retag/register composer headers (ItemTable and/or composerHeaders SQL) for %s → %s", from, to),
 		Count:  totalTouch,
 	})
 
@@ -904,13 +904,12 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 		_ = db.Close()
 	}()
 
-	var headers vscdb.ComposerHeaders
-	ok, err := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers)
+	headers, src, err := vscdb.LoadComposerHeaders(db)
 	if err != nil {
 		return 0, 0, err
 	}
-	if !ok {
-		return 0, 0, fmt.Errorf("composer.composerHeaders not found (is this Cursor 3.0+?)")
+	if src == vscdb.HeadersNone {
+		return 0, 0, fmt.Errorf("composer headers not found in ItemTable or composerHeaders SQL table (unsupported Cursor storage layout?)")
 	}
 
 	sourceSet := toSet(plan.SourceWSIDs)
@@ -1056,7 +1055,9 @@ func rewriteHeaders(globalDB, wsRoot string, plan *Plan) (updated, added int, er
 		}
 		return 0, 0, nil
 	}
-	if err := vscdb.SetItemJSON(db, "composer.composerHeaders", headers); err != nil {
+	// Prefer not to resurrect ItemTable["composer.composerHeaders"] after Cursor
+	// migrated to the dedicated SQL table (tableGateEnabled / migratedToTable).
+	if err := vscdb.PersistComposerHeadersItemTable(db, headers, src); err != nil {
 		return updated, added, err
 	}
 	// Cursor 3 Agents Window reads the dedicated composerHeaders SQL table, not
@@ -1568,9 +1569,8 @@ func transferWorkspaceTabsPrimary(wsRoot, globalDBPath string, plan *Plan) (stri
 }
 
 func headerComposerIDsForPlan(db *sql.DB, plan *Plan) []string {
-	var headers vscdb.ComposerHeaders
-	ok, err := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers)
-	if err != nil || !ok {
+	headers, src, err := vscdb.LoadComposerHeaders(db)
+	if err != nil || src == vscdb.HeadersNone {
 		return nil
 	}
 	sourceSet := toSet(plan.SourceWSIDs)

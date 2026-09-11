@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-09-11
+
+### Fixed
+
+- Support newer Cursor builds that migrated chat headers from the `composer.composerHeaders` ItemTable entry to the dedicated `composerHeaders` SQL table.
+- Fix `rewrite headers: composer.composerHeaders not found` when rebinding chat history on Cursor builds using the new chat-header storage format.
+
 ## [1.0.0] - 2026-07-15
 
 First public release.
@@ -26,5 +33,4 @@ First public release.
 - Machine-move documentation (`docs/machine-move.md`) with backup/restore and prefix vs exact guidance
 - Contributing guide, code of conduct, security policy, changelog, and GitHub issue/PR templates
 
-[Unreleased]: https://github.com/Interittus13/cursor-rebind/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/Interittus13/cursor-rebind/releases/tag/v1.0.0

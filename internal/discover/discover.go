@@ -289,12 +289,11 @@ func loadHeaders(globalDB string) (HeaderIndex, error) {
 	}
 	defer db.Close()
 
-	var headers vscdb.ComposerHeaders
-	ok, err := vscdb.GetItemJSON(db, "composer.composerHeaders", &headers)
+	headers, src, err := vscdb.LoadComposerHeaders(db)
 	if err != nil {
 		return idx, err
 	}
-	if !ok {
+	if src == vscdb.HeadersNone {
 		idx.Loaded = true
 		return idx, nil
 	}
