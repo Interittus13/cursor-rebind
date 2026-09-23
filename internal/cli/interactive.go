@@ -32,9 +32,10 @@ func runInteractiveMenu() error {
 		fmt.Println("  1) Migrate a renamed or moved project")
 		fmt.Println("  2) Repair Agents/IDE after a partial migrate")
 		fmt.Println("  3) Scan workspaces")
-		fmt.Println("  4) Machine-move backup tips")
-		fmt.Println("  5) Quit")
-		fmt.Print("Choice [1-5]: ")
+		fmt.Println("  4) Prune stale leftovers (dry-run)")
+		fmt.Println("  5) Machine-move backup tips")
+		fmt.Println("  6) Quit")
+		fmt.Print("Choice [1-6]: ")
 		choice, err := readLine(in)
 		if err != nil {
 			return err
@@ -53,12 +54,16 @@ func runInteractiveMenu() error {
 				fmt.Fprintf(os.Stderr, "scan: %v\n", err)
 			}
 		case "4":
+			if err := runPrune(nil); err != nil {
+				fmt.Fprintf(os.Stderr, "prune: %v\n", err)
+			}
+		case "5":
 			printMachineMoveTips()
-		case "5", "q", "quit", "":
+		case "6", "q", "quit", "":
 			fmt.Println("Bye.")
 			return nil
 		default:
-			fmt.Println("Please enter a number from 1 to 5.")
+			fmt.Println("Please enter a number from 1 to 6.")
 		}
 		fmt.Println()
 	}
@@ -203,14 +208,28 @@ func promptTargetID(in *bufio.Reader, inv *discover.Inventory, to string) (strin
 	to = filepath.Clean(to)
 	var matches []discover.Workspace
 	for _, w := range inv.Workspaces {
-		if filepath.Clean(w.FolderPath) == to {
+		fp := filepath.Clean(w.FolderPath)
+		if fp == to || strings.HasPrefix(fp, to+".__rebind_orphan_") {
+			// Prefer live rows in the picker; still show orphans for awareness.
 			matches = append(matches, w)
 		}
 	}
-	if len(matches) <= 1 {
-		if len(matches) == 1 {
-			fmt.Printf("Using workspace id %s\n", matches[0].ID)
-			return matches[0].ID, nil
+	// Live (non-orphan) first for picking the keep id.
+	var live []discover.Workspace
+	for _, w := range matches {
+		if !discover.IsOrphanFolderPath(w.FolderPath) && !discover.IsOrphanFolderPath(w.FolderURI) {
+			live = append(live, w)
+		}
+	}
+	pickFrom := live
+	if len(pickFrom) == 0 {
+		pickFrom = matches
+	}
+
+	if len(pickFrom) <= 1 {
+		if len(pickFrom) == 1 {
+			fmt.Printf("Using workspace id %s\n", pickFrom[0].ID)
+			return pickFrom[0].ID, nil
 		}
 		raw, err := promptOptional(in, "Target workspace id (optional; leave blank to auto-pick)")
 		if err != nil {
@@ -218,24 +237,36 @@ func promptTargetID(in *bufio.Reader, inv *discover.Inventory, to string) (strin
 		}
 		return strings.TrimSpace(raw), nil
 	}
-	fmt.Printf("Multiple workspace entries point at %s:\n", to)
-	for i, w := range matches {
-		hint := ""
-		if w.HeaderChats > 0 {
-			hint = fmt.Sprintf(" (%d header chats)", w.HeaderChats)
-		} else if !w.PathExists {
-			hint = " (path missing)"
-		}
-		fmt.Printf("  %d) %s%s\n", i+1, w.ID, hint)
+
+	recommended := ""
+	if h := rebind.AssessPathHealth(inv, to, ""); h != nil && h.KeepID != "" {
+		recommended = h.KeepID
 	}
-	fmt.Print("Pick a number (or paste a workspace id): ")
+
+	fmt.Printf("SPLIT-BRAIN: %d workspace entries for %s\n", len(pickFrom), to)
+	fmt.Println("Pick the shell Cursor opens (usually fewer named chats / the newer empty id).")
+	for i, w := range pickFrom {
+		ex := "no"
+		if w.PathExists {
+			ex = "yes"
+		}
+		mark := ""
+		if w.ID == recommended {
+			mark = "  ← recommended keep"
+		}
+		fmt.Printf("  %d) %s  headers=%d  exists=%s%s\n", i+1, w.ID, w.HeaderChats, ex, mark)
+	}
+	fmt.Print("Pick a number (or paste a workspace id; blank = recommended): ")
 	line, err := readLine(in)
 	if err != nil {
 		return "", err
 	}
 	line = strings.TrimSpace(line)
-	if n, err := strconv.Atoi(line); err == nil && n >= 1 && n <= len(matches) {
-		return matches[n-1].ID, nil
+	if line == "" && recommended != "" {
+		return recommended, nil
+	}
+	if n, err := strconv.Atoi(line); err == nil && n >= 1 && n <= len(pickFrom) {
+		return pickFrom[n-1].ID, nil
 	}
 	return line, nil
 }
@@ -250,6 +281,11 @@ func promptPath(in *bufio.Reader, label string) (string, error) {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			fmt.Println("Path is required.")
+			continue
+		}
+		if paths.LooksLikeWorkspaceID(line) {
+			fmt.Println(paths.ErrWorkspaceIDAsPath("path", line))
+			fmt.Println("Enter the project folder path instead.")
 			continue
 		}
 		return absPath(expandHome(line)), nil

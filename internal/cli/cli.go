@@ -39,6 +39,8 @@ func Execute() error {
 		return nil
 	case "scan":
 		return runScan(args[1:])
+	case "prune":
+		return runPrune(args[1:])
 	case "doctor":
 		return runDoctor(args[1:])
 	case "map", "preview":
@@ -63,7 +65,8 @@ Run with no arguments in a terminal for a guided menu.
 
 Usage:
   cursor-rebind
-  cursor-rebind scan [--json]
+  cursor-rebind scan [--all] [--path <dir>] [--json]
+  cursor-rebind prune [--empty-projects] [--json] [--yes]
   cursor-rebind doctor [path] [--json]
   cursor-rebind map --from <old> --to <new> [--prefix] [--json]
   cursor-rebind migrate --from <old> --to <new> [--prefix] [--target-id <id>] [--cleanup] [--dry-run|--yes]
@@ -75,7 +78,8 @@ Usage:
 
 Commands:
   (no args) Guided menu (interactive terminal only)
-  scan      Inventory workspaces and chat identity
+  scan      Inventory workspaces and chat identity (hides stale noise by default)
+  prune     Preview/delete orphaned workspaceStorage + empty tmp/empty-window agent dirs
   doctor    Diagnose missing chats for a project path
   map       Build a rebind plan (alias: preview)
   migrate   Apply a rebind plan (quit Cursor first)
@@ -86,17 +90,38 @@ Commands:
 Notes:
   --cleanup  After exact migrate/repair, delete orphaned old workspaceStorage
              dirs (not your project folder). Refused with --prefix.
+  scan       Default view hides .__rebind_orphan_*, empty-window, tmp-*, and
+             0-transcript agent dirs. Use scan --all to show everything.
+             scan --path <dir> limits the table to one project.
+  prune      Dry-run by default. Quit Cursor, then prune --yes to delete
+             (backs up under ~/.cursor-rebind/backups/).
+  --from/--to must be folder paths, not workspace ids (use --target-id for ids).
 `, Version)
 }
 
 func runScan(args []string) error {
 	asJSON := false
-	for _, a := range args {
+	showAll := false
+	pathFilter := ""
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch a {
 		case "--json":
 			asJSON = true
+		case "--all":
+			showAll = true
+		case "--path":
+			if i+1 >= len(args) {
+				return fmt.Errorf("scan: --path requires a directory")
+			}
+			i++
+			pathFilter = args[i]
 		case "-h", "--help":
-			fmt.Println("Usage: cursor-rebind scan [--json]")
+			fmt.Println("Usage: cursor-rebind scan [--all] [--path <dir>] [--json]")
+			fmt.Println()
+			fmt.Println("By default hides stale noise (rebind orphans, empty-window, tmp-*,")
+			fmt.Println("0-transcript agent dirs). Pass --all to list everything.")
+			fmt.Println("--path limits the table to one project folder (and its orphan siblings).")
 			return nil
 		default:
 			return fmt.Errorf("scan: unknown flag %q", a)
@@ -112,23 +137,41 @@ func runScan(args []string) error {
 		return err
 	}
 
+	workspaces, projects, hiddenWS, hiddenProj := discover.FilterInventory(inv, !showAll)
+	if pathFilter != "" {
+		if paths.LooksLikeWorkspaceID(pathFilter) {
+			return paths.ErrWorkspaceIDAsPath("--path", pathFilter)
+		}
+		pathFilter = absPath(expandHome(pathFilter))
+		workspaces, projects = discover.FilterByPath(workspaces, projects, pathFilter)
+		hiddenWS, hiddenProj = 0, 0 // counts are for pre-path filter; avoid confusing footer
+	}
+
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		// Avoid dumping every header entry in default JSON (can be large).
 		type scanOut struct {
-			Roots      paths.Roots             `json:"roots"`
-			Workspaces []discover.Workspace    `json:"workspaces"`
-			Projects   []discover.AgentProject `json:"projects"`
-			Headers    discover.HeaderIndex    `json:"headers"`
-			ScannedAt  interface{}             `json:"scannedAt"`
+			Roots            paths.Roots             `json:"roots"`
+			Workspaces       []discover.Workspace    `json:"workspaces"`
+			Projects         []discover.AgentProject `json:"projects"`
+			Headers          discover.HeaderIndex    `json:"headers"`
+			ScannedAt        interface{}             `json:"scannedAt"`
+			HiddenWorkspaces int                     `json:"hiddenWorkspaces,omitempty"`
+			HiddenProjects   int                     `json:"hiddenProjects,omitempty"`
+			ShowingAll       bool                    `json:"showingAll"`
+			PathFilter       string                  `json:"pathFilter,omitempty"`
 		}
 		return enc.Encode(scanOut{
-			Roots:      inv.Roots,
-			Workspaces: inv.Workspaces,
-			Projects:   inv.Projects,
-			Headers:    inv.Headers,
-			ScannedAt:  inv.ScannedAt,
+			Roots:            inv.Roots,
+			Workspaces:       workspaces,
+			Projects:         projects,
+			Headers:          inv.Headers,
+			ScannedAt:        inv.ScannedAt,
+			HiddenWorkspaces: hiddenWS,
+			HiddenProjects:   hiddenProj,
+			ShowingAll:       showAll,
+			PathFilter:       pathFilter,
 		})
 	}
 
@@ -137,9 +180,20 @@ func runScan(args []string) error {
 	fmt.Printf("User data:   %s\n", roots.UserDataDir)
 	fmt.Printf("Global DB:   %s\n", roots.GlobalDB)
 	fmt.Printf("Projects:    %s\n", roots.ProjectsDir)
-	fmt.Printf("Workspaces:  %d\n", len(inv.Workspaces))
-	fmt.Printf("Agent dirs:  %d\n", len(inv.Projects))
-	if inv.Headers.Loaded {
+	if pathFilter != "" {
+		fmt.Printf("Filter:      %s\n", pathFilter)
+	}
+	fmt.Printf("Workspaces:  %d", len(workspaces))
+	if pathFilter == "" && !showAll && len(inv.Workspaces) != len(workspaces) {
+		fmt.Printf(" (of %d)", len(inv.Workspaces))
+	}
+	fmt.Println()
+	fmt.Printf("Agent dirs:  %d", len(projects))
+	if pathFilter == "" && !showAll && len(inv.Projects) != len(projects) {
+		fmt.Printf(" (of %d)", len(inv.Projects))
+	}
+	fmt.Println()
+	if pathFilter == "" && inv.Headers.Loaded {
 		fmt.Printf("Headers:     %d chats", inv.Headers.Total)
 		if inv.Headers.MissingPath > 0 {
 			fmt.Printf(" (%d without path)", inv.Headers.MissingPath)
@@ -151,14 +205,14 @@ func runScan(args []string) error {
 				fmt.Printf("  %-40s %d\n", k, n)
 			}
 		}
-	} else if inv.Headers.Error != "" {
+	} else if pathFilter == "" && inv.Headers.Error != "" {
 		fmt.Printf("Headers:     error: %s\n", inv.Headers.Error)
 	}
 	fmt.Println()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tEXISTS\tHEADERS\tSCHEMA\tPATH")
-	for _, ws := range inv.Workspaces {
+	for _, ws := range workspaces {
 		ex := "no"
 		if ws.PathExists {
 			ex = "yes"
@@ -179,15 +233,98 @@ func runScan(args []string) error {
 	_ = w.Flush()
 	fmt.Println()
 	fmt.Println("Tip: pass ID to migrate/repair with --target-id when several rows share the same PATH.")
+	if pathFilter == "" && !showAll && (hiddenWS > 0 || hiddenProj > 0) {
+		fmt.Printf("Hidden: %d workspace(s), %d agent dir(s) — scan --all to show; prune to delete safe leftovers.\n", hiddenWS, hiddenProj)
+	}
+	if pathFilter != "" && len(workspaces) == 0 {
+		fmt.Println("No workspaces matched this path. Try scan --all --path <dir> or check the folder exists.")
+	}
 
 	fmt.Println()
 	fmt.Println("Agent projects:")
 	w = tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "TRANSCRIPTS\tNAME")
-	for _, p := range inv.Projects {
+	for _, p := range projects {
 		fmt.Fprintf(w, "%d\t%s\n", p.TranscriptCount, p.Name)
 	}
 	_ = w.Flush()
+	return nil
+}
+
+func runPrune(args []string) error {
+	asJSON := false
+	yes := false
+	includeEmpty := false
+	for _, a := range args {
+		switch a {
+		case "--json":
+			asJSON = true
+		case "--yes":
+			yes = true
+		case "--empty-projects":
+			includeEmpty = true
+		case "-h", "--help":
+			fmt.Println("Usage: cursor-rebind prune [--empty-projects] [--json] [--yes]")
+			fmt.Println()
+			fmt.Println("Dry-run by default. Lists safe leftovers:")
+			fmt.Println("  • workspaceStorage dirs marked .__rebind_orphan_*")
+			fmt.Println("  • empty-window workspaceStorage (if present)")
+			fmt.Println("  • tmp-*/empty-window/numeric agent dirs with 0 transcripts")
+			fmt.Println()
+			fmt.Println("--empty-projects also lists 0-transcript path-like agent dirs (still opt-in).")
+			fmt.Println("Quit Cursor, then pass --yes to delete (creates a backup first).")
+			return nil
+		default:
+			return fmt.Errorf("prune: unknown flag %q", a)
+		}
+	}
+
+	roots, err := paths.Discover()
+	if err != nil {
+		return err
+	}
+	inv, err := discover.Scan(roots)
+	if err != nil {
+		return err
+	}
+
+	dryRun := !yes
+	res, err := rebind.PruneStale(inv, includeEmpty, dryRun)
+	if err != nil {
+		return err
+	}
+
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(res)
+	}
+
+	fmt.Println("cursor-rebind prune")
+	fmt.Println("===================")
+	if len(res.Candidates) == 0 {
+		fmt.Println("Nothing to prune.")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "KIND\tSAFE\tLABEL\tPATH")
+	for _, c := range res.Candidates {
+		safe := "no"
+		if c.Safe {
+			safe = "yes"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", c.Kind, safe, c.Label, c.Path)
+	}
+	_ = w.Flush()
+	fmt.Println()
+	if dryRun {
+		fmt.Printf("%d candidate(s). Dry-run only — quit Cursor, then: cursor-rebind prune --yes\n", len(res.Candidates))
+		return nil
+	}
+	fmt.Printf("Removed %d path(s).\n", len(res.Removed))
+	if res.BackupID != "" {
+		fmt.Printf("Backup: %s (cursor-rebind restore %s)\n", res.BackupID, res.BackupID)
+	}
 	return nil
 }
 
@@ -325,6 +462,14 @@ func absPath(p string) string {
 	return abs
 }
 
+// requireFolderPath rejects workspace-storage hashes pasted into --from/--to/--path.
+func requireFolderPath(flag, value string) error {
+	if paths.LooksLikeWorkspaceID(value) {
+		return paths.ErrWorkspaceIDAsPath(flag, value)
+	}
+	return nil
+}
+
 func runPlan(cmd string, args []string) error {
 	f, _, err := parsePathFlags(args)
 	if err != nil {
@@ -336,6 +481,12 @@ func runPlan(cmd string, args []string) error {
 	}
 	if f.from == "" || f.to == "" {
 		return fmt.Errorf("%s requires --from and --to", cmd)
+	}
+	if err := requireFolderPath("--from", f.from); err != nil {
+		return err
+	}
+	if err := requireFolderPath("--to", f.to); err != nil {
+		return err
 	}
 	f.from, f.to = absPath(f.from), absPath(f.to)
 
@@ -376,6 +527,12 @@ func runMigrate(args []string) error {
 	}
 	if f.from == "" || f.to == "" {
 		return fmt.Errorf("migrate requires --from and --to")
+	}
+	if err := requireFolderPath("--from", f.from); err != nil {
+		return err
+	}
+	if err := requireFolderPath("--to", f.to); err != nil {
+		return err
 	}
 	if f.dryRun && f.yes {
 		return fmt.Errorf("use either --dry-run or --yes, not both")
@@ -435,6 +592,14 @@ func runRepair(args []string) error {
 	}
 	if f.to == "" {
 		return fmt.Errorf("repair requires --to")
+	}
+	if err := requireFolderPath("--to", f.to); err != nil {
+		return err
+	}
+	if f.from != "" {
+		if err := requireFolderPath("--from", f.from); err != nil {
+			return err
+		}
 	}
 	if !f.yes {
 		return fmt.Errorf("repair requires --yes (quit Cursor first)")

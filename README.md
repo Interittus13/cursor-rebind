@@ -80,6 +80,10 @@ Download the Windows archive from [Releases](https://github.com/Interittus13/cur
 cursor-rebind
 
 cursor-rebind scan
+cursor-rebind scan --all
+cursor-rebind scan --path /path/to/project
+cursor-rebind prune          # dry-run safe leftovers
+cursor-rebind prune --yes    # quit Cursor first; backs up then deletes
 cursor-rebind doctor /path/to/project
 
 # Preview a rebind
@@ -161,13 +165,14 @@ cursor-rebind migrate --from /home/olduser --to /home/newuser --prefix --yes
 
 ### Notes
 
-- Quit Cursor completely before `migrate` / `repair` (reload is not enough).
+- Quit Cursor completely before `migrate` / `repair` / `prune --yes` (reload is not enough).
 - Prefer `--target-id` when multiple `workspaceStorage` entries exist for the same folder.
+- `--from` / `--to` must be **folder paths**, not the 32-character workspace ids from `scan` (those go in `--target-id`). Pasting an id as a path is rejected with a hint.
 - **Never delete the empty shell** Cursor minted for `--to` and consolidate onto the older data leftover — Cursor remints that shell and IDE/Agents stay empty. Migrate/repair attach chats **onto** the emptiest/newest shell, then orphan siblings.
 - Exact `migrate` / `repair` run a post-apply **health check** (single live workspace id + named chats on that id). Failure exits non-zero with a `repair --to` hint; use `verify` / `doctor` to detect `SPLIT-BRAIN`.
 - `migrate` strategy (`create` / `replace-empty` / `merge`) chooses plan messaging and which chat becomes the primary tab. Apply steps are the same; **merge does not combine two threads into one**.
-- Tool backups from migrate/repair live under `~/.cursor-rebind/backups/` and can be listed with `cursor-rebind restore --list`.
-- Use `--cleanup` only after you are happy with the migrate; default is to keep path-orphaned storage as a safety net.
+- Tool backups from migrate/repair/prune live under `~/.cursor-rebind/backups/` and can be listed with `cursor-rebind restore --list`.
+- Use `--cleanup` only after you are happy with the migrate; default is to keep path-orphaned storage as a safety net. Later, `prune` (or migrate `--cleanup`) can remove those orphans.
 
 ## How it works
 

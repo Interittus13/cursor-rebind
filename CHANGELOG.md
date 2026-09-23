@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-23
+
+### Added
+
+- `scan` hides stale noise by default (`.__rebind_orphan_*` workspaces, `empty-window`, `tmp-*` / numeric session agent dirs, and 0-transcript agent dirs). Pass `scan --all` to show everything.
+- `scan --path <dir>` filters the workspace/agent tables to one project (includes `.__rebind_orphan_*` siblings).
+- `prune` previews (default) or deletes (`--yes`) safe leftovers: orphaned `workspaceStorage` dirs and empty ephemeral agent project dirs. Creates a backup first. Optional `--empty-projects` also includes 0-transcript path-like agent dirs.
+- Reject workspace-storage hashes pasted into `--from` / `--to` / `scan --path` (and the guided menu path prompts). Use the project folder path plus `--target-id` instead.
+- Guided migrate/repair picker labels SPLIT-BRAIN rows with header counts and a recommended keep id.
+
 ## [1.0.1] - 2026-09-11
 
 ### Fixed
@@ -33,4 +43,6 @@ First public release.
 - Machine-move documentation (`docs/machine-move.md`) with backup/restore and prefix vs exact guidance
 - Contributing guide, code of conduct, security policy, changelog, and GitHub issue/PR templates
 
+[Unreleased]: https://github.com/Interittus13/cursor-rebind/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/Interittus13/cursor-rebind/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/Interittus13/cursor-rebind/releases/tag/v1.0.0
