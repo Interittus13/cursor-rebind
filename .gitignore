@@ -8,6 +8,7 @@
 /coverage.out
 /goreleaser
 /.tmp/
+/.tools/
 /.gocache/
 /.gomodcache/
 

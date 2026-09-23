@@ -154,7 +154,12 @@ After a rename or machine move, Cursor may leave **two** `workspaceStorage/<id>/
 
 ```bash
 cursor-rebind doctor /path/to/project   # look for SPLIT-BRAIN
+cursor-rebind scan --path /path/to/project
 # quit Cursor fully
 cursor-rebind repair --to /path/to/project --yes
+# optional: pick keep id explicitly from scan
+# cursor-rebind repair --to /path/to/project --target-id <id> --yes
 cursor-rebind verify /path/to/project
 ```
+
+`--from` / `--to` are **folder paths**. The 32-character `ID` column from `scan` belongs in `--target-id` only. After migrate/repair, `cursor-rebind prune` can remove `.__rebind_orphan_*` workspaceStorage leftovers (dry-run by default).

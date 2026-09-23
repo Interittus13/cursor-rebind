@@ -256,10 +256,7 @@ func scanProjects(dir string) ([]AgentProject, error) {
 
 func inferPathFromProjectName(name string) string {
 	// Skip ephemeral / numeric session folders.
-	if name == "empty-window" || strings.HasPrefix(name, "tmp-") {
-		return ""
-	}
-	if len(name) > 0 && name[0] >= '0' && name[0] <= '9' && !strings.Contains(name, "-") {
+	if IsEphemeralProjectName(name) {
 		return ""
 	}
 	// Reverse sanitization is lossy (can't recover which '-' were separators),
